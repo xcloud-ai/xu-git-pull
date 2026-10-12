@@ -1,0 +1,107 @@
+/* XU Git Pull — 变更预览 Modal */
+
+.xu-gp-modal {
+  width: 720px;
+}
+
+.xu-gp-desc {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  margin: 8px 0 12px;
+}
+
+.xu-gp-summary {
+  font-size: var(--font-ui-small);
+  margin-bottom: 8px;
+}
+
+.xu-gp-list {
+  max-height: 46vh;
+  overflow-y: auto;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s, 6px);
+  margin-bottom: 8px;
+}
+
+.xu-gp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--background-modifier-border);
+  font-size: var(--font-ui-small);
+}
+
+.xu-gp-row:last-child {
+  border-bottom: none;
+}
+
+.xu-gp-badge {
+  flex: 0 0 auto;
+  min-width: 44px;
+  text-align: center;
+  padding: 1px 8px;
+  border-radius: var(--radius-s, 6px);
+  font-size: var(--font-ui-smaller);
+}
+
+.xu-gp-badge-add {
+  background: var(--background-modifier-success);
+  color: var(--text-on-accent);
+}
+
+.xu-gp-badge-modify {
+  background: var(--background-modifier-warning);
+  color: var(--text-normal);
+}
+
+.xu-gp-badge-same {
+  background: var(--background-secondary);
+  color: var(--text-muted);
+}
+
+.xu-gp-path {
+  flex: 1 1 auto;
+  word-break: break-all;
+}
+
+.xu-gp-size {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+}
+
+.xu-gp-same {
+  opacity: 0.55;
+}
+
+.xu-gp-progress-wrap {
+  margin: 8px 0;
+}
+
+.xu-gp-progress {
+  height: 6px;
+  border-radius: var(--radius-s, 6px);
+  background: var(--background-modifier-border);
+  overflow: hidden;
+}
+
+.xu-gp-progress-bar {
+  height: 100%;
+  width: var(--xu-gp-pct, 0%);
+  background: var(--interactive-accent);
+  transition: width 150ms ease;
+}
+
+.xu-gp-progress-text {
+  margin-top: 4px;
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.xu-gp-footer .setting-item {
+  border: none;
+  padding: 8px 0 0;
+  justify-content: flex-end;
+}
