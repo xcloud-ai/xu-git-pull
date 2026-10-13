@@ -8,6 +8,11 @@ const PLUGIN_ID = 'xu-git-pull';
 const REPO_URL = 'https://github.com/xcloud-ai/xu-git-pull';
 // 仅 GitHub 匿名下载走 raw 直连；GitCode/Gitee 公开库匿名也走 blob API（已实测支持）
 const RAW_BASE = 'https://raw.githubusercontent.com';
+// 下载并发数：三平台统一 4——GitHub/Gitee 配额虽宽裕，低并发实测速度可接受，统一可减少认知负担
+// （自适应并发会在此基础上动态调节：429 减半、连续成功回升）
+const DOWNLOAD_CONCURRENCY = { github: 4, gitee: 4, gitcode: 4 };
+// 单请求超时 30s（requestUrl 无内建超时，僵死连接会永久卡住队列）
+const DOWNLOAD_TIMEOUT_MS = 30000;
 
 // ================================================================
 //  i18n
@@ -19,6 +24,7 @@ const I18N = {
     notice_no_repo: '请先在设置中填写 GitHub 仓库（owner/repo）',
     notice_repo_invalid: '仓库格式不正确，应为 owner/repo',
     notice_checking: '正在获取远程文件清单…',
+    notice_checking_progress: '正在比对本地文件… {done}/{total}',
     notice_fetch_failed: '获取远程信息失败：{msg}',
     notice_repo_not_found: '仓库不存在、无权限，或为私有库（私有库需在高级设置中填写 Token）',
     notice_unauthorized: 'Token 无效或已过期，请检查后重试',
@@ -33,9 +39,20 @@ const I18N = {
     label_same: '无变化',
     btn_download_all: '全部下载（{n} 项变更）',
     btn_cancel: '取消',
+    btn_canceling: '取消中…',
+    notice_aborted: '已取消下载：完成 {done}/{total}（已下载部分保留，下次拉取自动跳过）',
     downloading: '正在下载 {index}/{total}：{name}',
     notice_done: '下载完成：{n} 个文件已更新',
     notice_failed: '{ok} 个成功，{fail} 个失败：{names}（原因：{reason}）',
+    err_download_timeout: '下载超时：网络无响应',
+    err_rate_limit_dead: '平台限流：请求过于频繁，配额暂用尽',
+    notice_rate_limit_abort: '触发平台限流，已暂停下载：完成 {done}/{total}。已下载部分保留，稍后可重试',
+    downloading_throttle: '已触发平台限流，自动降速等待中…',
+    downloading_waiting: '正在连接服务器… {secs}s',
+    notice_background: '弹窗已关闭，下载转入后台继续（通知上可随时取消）',
+    notice_download_busy: '已有下载任务进行中，请等它完成或先取消',
+    statusbar_abort: '下载中，点击取消',
+    notice_first_fail: '下载失败：{name}（{reason}）——同类失败不再重复提示，结束后汇总',
     setting_title: 'XU Git Pull（远程资料拉取）',
     setting_header_desc: '从 GitHub 仓库（支持私有库）单向拉取文件到本 vault：比对远程与本地差异，确认后一键覆盖，适合手机/平板只看资料的场景。只增改，不删除本地文件。',
     setting_language: '界面语言',
@@ -92,6 +109,7 @@ const I18N = {
     notice_no_repo: 'Set a GitHub repository (owner/repo) in settings first',
     notice_repo_invalid: 'Invalid repository format, expected owner/repo',
     notice_checking: 'Fetching remote file list…',
+    notice_checking_progress: 'Comparing local files… {done}/{total}',
     notice_fetch_failed: 'Failed to fetch remote info: {msg}',
     notice_repo_not_found: 'Repository not found, inaccessible, or private (a token is required for private repos)',
     notice_unauthorized: 'Token is invalid or expired. Check it and try again.',
@@ -106,9 +124,20 @@ const I18N = {
     label_same: 'Unchanged',
     btn_download_all: 'Download all ({n} changes)',
     btn_cancel: 'Cancel',
+    btn_canceling: 'Cancelling…',
+    notice_aborted: 'Download cancelled: {done}/{total} done (downloaded files are kept and skipped next time)',
     downloading: 'Downloading {index}/{total}: {name}',
     notice_done: 'Download complete: {n} file(s) updated',
     notice_failed: '{ok} succeeded, {fail} failed: {names} (reason: {reason})',
+    err_download_timeout: 'Download timed out: no response',
+    err_rate_limit_dead: 'Platform rate limit: too many requests, quota exhausted',
+    notice_rate_limit_abort: 'Rate limited by the platform. Download paused: {done}/{total} done. Downloaded files are kept — retry later',
+    downloading_throttle: 'Rate limited — throttling automatically…',
+    downloading_waiting: 'Connecting to server… {secs}s',
+    notice_background: 'Modal closed — download continues in background (cancel via the notice)',
+    notice_download_busy: 'A download is already running — wait or cancel it first',
+    statusbar_abort: 'Downloading — click to cancel',
+    notice_first_fail: 'Download failed: {name} ({reason}) — summarized at the end',
     setting_title: 'XU Git Pull',
     setting_header_desc: 'One-way pull from a GitHub repo (private supported) into this vault: compare remote vs local, then overwrite with one tap — ideal for read-only phones/tablets. Files are added/updated, never deleted.',
     setting_language: 'UI language',
@@ -313,6 +342,12 @@ class GitPullPlugin extends Plugin {
 
     this.addRibbonIcon('download', this.t('ribbon_pull'), () => { void this.pull(); });
 
+    // 状态栏兜底入口：后台下载时显示进度，通知被误关后仍可从状态栏取消
+    this._statusEl = this.addStatusBarItem();
+    this.registerDomEvent(this._statusEl, 'click', () => {
+      if (this._activeAbort) this._activeAbort();
+    });
+
     this.addCommand({
       id: 'pull-latest',
       name: this.t('cmd_pull'),
@@ -337,18 +372,26 @@ class GitPullPlugin extends Plugin {
     return (this.settings.platform || 'github') === 'gitcode';
   }
 
-  /** 取完整文件树：统一入口，内部按平台处理分页差异 */
+  /** 取完整文件树：统一入口。GitCode 分页页与页之间并行预取（每批 5 页），大幅缩短大仓库等待 */
   async fetchTreeAll(owner, repo, ref) {
     const base = this.apiBase() + '/repos/' + owner + '/' + repo + '/git/trees/' + encodeURIComponent(ref);
     if (!this.paginatesTree()) {
       return this.apiGetJson(base + '?recursive=1');
     }
     const merged = [];
-    for (let page = 1; page <= 50; page++) {
-      const d = await this.apiGetJson(base + '?recursive=1&per_page=100&page=' + page);
-      const batch = Array.isArray(d.tree) ? d.tree : [];
-      merged.push(...batch);
-      if (batch.length < 100) break;
+    const fetchPage = (page) =>
+      this.apiGetJson(base + '?recursive=1&per_page=100&page=' + page).catch(() => ({ tree: [] }));
+    let page = 1;
+    let more = true;
+    while (more && merged.length <= 20000) {
+      const batch = [];
+      for (let k = 0; k < 5; k++) batch.push(page++);
+      const results = await Promise.all(batch.map(fetchPage));
+      for (const d of results) {
+        const items = Array.isArray(d.tree) ? d.tree : [];
+        merged.push(...items);
+        if (items.length < 100) more = false; // 短页=最后一页
+      }
     }
     return { tree: merged, truncated: false };
   }
@@ -570,25 +613,34 @@ class GitPullPlugin extends Plugin {
       }
 
       const prefix = cfg.remotePath ? cfg.remotePath + '/' : '';
+      // 先筛出候选文件（类型/前缀），再分批并行算本地 SHA（每批 16 个，文件多时比串行快一个量级）
+      const candidates = (tree.tree || []).filter((item) =>
+        item.type === 'blob' && item.mode !== '120000' && (!prefix || item.path.startsWith(prefix)));
       const entries = [];
-      for (const item of tree.tree) {
-        if (item.type !== 'blob' || item.mode === '120000') continue;
-        if (prefix && !item.path.startsWith(prefix)) continue;
-        const rel = prefix ? item.path.slice(prefix.length) : item.path;
-        if (!rel || rel.split('/').includes('..')) continue; // 防越界
-        if (matchAny(rel, cfg.matchers)) continue;
-        const localPath = normalizePath(cfg.localPath ? cfg.localPath + '/' + rel : rel);
-        let status = 'add';
-        try {
-          const exists = await this.app.vault.adapter.exists(localPath);
-          if (exists) {
-            const buf = await this.app.vault.adapter.readBinary(localPath);
-            status = (await gitBlobSha(buf)) === item.sha ? 'same' : 'modify';
+      const CHUNK = 16;
+      for (let i = 0; i < candidates.length; i += CHUNK) {
+        const chunk = candidates.slice(i, i + CHUNK);
+        const results = await Promise.all(chunk.map(async (item) => {
+          const rel = prefix ? item.path.slice(prefix.length) : item.path;
+          if (!rel || rel.split('/').includes('..')) return null; // 防越界
+          if (matchAny(rel, cfg.matchers)) return null;
+          const localPath = normalizePath(cfg.localPath ? cfg.localPath + '/' + rel : rel);
+          let status = 'add';
+          try {
+            const exists = await this.app.vault.adapter.exists(localPath);
+            if (exists) {
+              const buf = await this.app.vault.adapter.readBinary(localPath);
+              status = (await gitBlobSha(buf)) === item.sha ? 'same' : 'modify';
+            }
+          } catch (e) {
+            status = 'add'; // 本地读取异常按新增处理，下载时会暴露真实错误
           }
-        } catch (e) {
-          status = 'add'; // 本地读取异常按新增处理，下载时会暴露真实错误
-        }
-        entries.push({ rel, localPath, sha: item.sha, size: item.size, status });
+          return { rel, localPath, sha: item.sha, size: item.size, status };
+        }));
+        for (const r of results) if (r) entries.push(r);
+        notice.setMessage(this.t('notice_checking_progress', {
+          done: Math.min(i + CHUNK, candidates.length), total: candidates.length,
+        }));
       }
 
       notice.hide();
@@ -608,6 +660,85 @@ class GitPullPlugin extends Plugin {
       new Notice(msg, 5000);
       console.error('[' + PLUGIN_ID + ']', err);
     }
+  }
+
+  /** 单文件下载：包一层超时（requestUrl 无内建超时，僵死连接会永久卡住队列）。
+   *  同时挂取消侦听：点取消后 120ms 内中断等待立即放行（底层请求无法真正中止，但队列马上走人） */
+  downloadWithTimeout(meta, entry) {
+    const dl = this.downloadBlob(meta, entry);
+    const timeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(this.t('err_download_timeout'))), DOWNLOAD_TIMEOUT_MS));
+    const abort = new Promise((_, reject) => {
+      const iv = setInterval(() => {
+        if (this._cancelAll) {
+          clearInterval(iv);
+          const e = new Error('aborted');
+          e.code = 'aborted';
+          reject(e);
+        }
+      }, 120);
+      dl.finally(() => clearInterval(iv)).catch(() => {});
+    });
+    return Promise.race([dl, timeout, abort]);
+  }
+
+  /** 单文件下载：失败自动重试。429 限流特殊处理——全局共享退避窗口，所有并发 worker 一起降速等待后重试 */
+  async downloadWithRetry(meta, entry) {
+    let lastErr;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        const wait = (this._throttleUntil || 0) - Date.now();
+        if (wait > 0) {
+          // 退避等待期间在进度栏明示「限流降速中」，消除「卡住不动」的假死观感
+          if (this._onThrottleWait) this._onThrottleWait();
+          // 分段睡眠：每 250ms 检查一次取消标志，点取消后亚秒级响应
+          for (let t = 0; t < wait && !this._cancelAll; t += 250) {
+            await new Promise((r) => setTimeout(r, Math.min(250, wait - t)));
+          }
+          if (this._cancelAll) {
+            const e = new Error('aborted');
+            e.code = 'aborted';
+            throw e;
+          }
+        }
+        const buf = await this.downloadWithTimeout(meta, entry);
+        this._rateLimitStreak = 0; // 任一请求成功即视为限流解除，重新计数
+        // 自适应并发：连续 20 个成功且未达平台上限时逐步回升
+        this._okStreak = (this._okStreak || 0) + 1;
+        if (this._okStreak >= 20 && this._concLimit < (this._concMax || 4)) {
+          this._concLimit++;
+          this._okStreak = 0;
+        }
+        return buf;
+      } catch (err) {
+        lastErr = err;
+        const msg = String((err && err.message) || err);
+        if (msg.includes('status 429')) {
+          // GitCode 等平台为配额型限流（无响应头、429 极速返回）：退避窗口 3s 起逐次加倍，封顶 60s
+          this._rateLimitStreak = (this._rateLimitStreak || 0) + 1;
+          const backoff = Math.min(3000 * Math.pow(2, attempt), 60000);
+          this._throttleUntil = Math.max(this._throttleUntil || 0, Date.now() + backoff);
+          // 自适应并发减半（下限 1）：与退避窗口配合，减少窗口内的在途请求
+          this._concLimit = Math.max(1, Math.floor((this._concLimit || 4) / 2));
+          // 连续 15 次 429：判定配额窗口内退避无意义（分钟级起步），主动中止整个队列避免长时间假死
+          if (this._rateLimitStreak >= 15) {
+            const e = new Error(this.t('err_rate_limit_dead'));
+            e.code = 'rate_limit_dead';
+            throw e;
+          }
+          continue;
+        }
+        if (attempt >= 2) break; // 非限流错误最多试 3 次
+        if (this._cancelAll) {
+          // 已取消：不再等待重试间隔，立即跳出
+          const e = new Error('aborted');
+          e.code = 'aborted';
+          throw e;
+        }
+        await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+      }
+    }
+    throw lastErr;
   }
 
   /**
@@ -642,6 +773,8 @@ class PullPreviewModal extends Modal {
     this.entries = entries;
     this.meta = meta;
     this.busy = false;
+    this.abort = false;
+    this.abortReason = '';
   }
 
   t(key, params) { return this.plugin.t(key, params); }
@@ -690,57 +823,166 @@ class PullPreviewModal extends Modal {
         b.setButtonText(this.t('btn_download_all', { n: changes.length }));
         b.onClick(() => { void this.runDownload(); });
       })
-      .addButton((b) => b.setButtonText(this.t('btn_cancel')).onClick(() => {
-        if (!this.busy) this.close();
-      }));
+      .addButton((b) => {
+        this.cancelBtn = b;
+        b.setButtonText(this.t('btn_cancel')).onClick(() => {
+          if (this.busy) {
+            // 下载中点取消：请求中止队列（取消侦听 120ms 内放行所有 worker），按钮与进度行立即反馈
+            this.abort = true;
+            this.plugin._cancelAll = true;
+            b.setButtonText(this.t('btn_canceling'));
+            this.setProgressText(this.t('btn_canceling'));
+          } else this.close();
+        });
+      });
   }
 
   onClose() {
+    // 下载中关闭弹窗（×/ESC）：不中止任务，转入后台继续，进度与取消移到常驻通知
+    if (this.busy && !this.abort) {
+      this.detached = true;
+      this.bgNotice = new Notice('', 0);
+      const btn = this.bgNotice.noticeEl.createEl('button', { text: this.t('btn_cancel'), cls: 'xu-gp-bg-cancel' });
+      btn.addEventListener('click', () => {
+        this.abort = true;
+        this.plugin._cancelAll = true; // 取消侦听 120ms 内放行所有 worker
+        btn.disabled = true;
+        this.setProgressText(this.t('btn_canceling'));
+      });
+      new Notice(this.t('notice_background'), 4000);
+    }
     this.contentEl.empty();
+  }
+
+  /** 进度文本统一出口：弹窗内进度行 + 后台常驻通知一起更新 */
+  setProgressText(text) {
+    this.progressText.setText(text);
+    if (this.bgNotice) this.bgNotice.setMessage(text);
   }
 
   setProgress(index, total, name) {
     const pct = total ? Math.round((index / total) * 100) : 0;
     this.progressWrap.querySelector('.xu-gp-progress-bar').style.setProperty('--xu-gp-pct', pct + '%');
-    this.progressText.setText(this.t('downloading', { index, total, name }));
+    this.setProgressText(this.t('downloading', { index, total, name }));
+    if (this.plugin._statusEl) this.plugin._statusEl.setText('⬇ ' + index + '/' + total);
   }
 
   async runDownload() {
     const targets = this.entries.filter((e) => e.status !== 'same');
-    if (targets.length === 0 || this.busy) return;
+    if (targets.length === 0) return;
+    // 插件级锁：后台下载进行中拒绝第二个下载队列（避免限流雪崩）
+    if (this.plugin._downloadBusy) {
+      new Notice(this.plugin.t('notice_download_busy'), 4000);
+      return;
+    }
+    this.plugin._downloadBusy = true;
     this.busy = true;
     this.downloadBtn.setDisabled(true);
     this.progressWrap.show();
+    // 立即给出进度反馈（0/N），点下载后不再有无反馈空窗
+    this.setProgress(0, targets.length, '…');
+    // 状态栏兜底入口：后台通知被误关后仍可从这里取消
+    this.plugin._activeAbort = () => { this.abort = true; this.plugin._cancelAll = true; };
+    if (this.plugin._statusEl) {
+      this.plugin._statusEl.setText('⬇ 0/' + targets.length);
+      this.plugin._statusEl.setAttribute('aria-label', this.t('statusbar_abort'));
+    }
 
     let ok = 0;
     const failed = [];
     let firstError = '';
-    let i = 0;
-    for (const e of targets) {
-      i++;
-      this.setProgress(i - 1, targets.length, e.rel);
-      try {
-        const buf = await this.plugin.downloadBlob(this.meta, e);
-        // writeBinary 不会自动创建目录：先逐级确保父目录存在（否则新子目录下全部下载失败）
-        const slash = e.localPath.lastIndexOf('/');
-        if (slash > 0) await this.ensureDir(e.localPath.slice(0, slash));
-        await this.app.vault.adapter.writeBinary(e.localPath, buf);
-        ok++;
-      } catch (err) {
-        console.error('[' + PLUGIN_ID + '] download failed:', e.rel, err);
-        failed.push(e.rel);
-        if (!firstError) firstError = (err && err.message) || String(err);
+    let done = 0;
+    let cursor = 0;
+    // 自适应并发：初始 = 平台上限；429 时减半（下限 1），连续成功后逐步回升
+    const maxConc = DOWNLOAD_CONCURRENCY[this.plugin.settings.platform] || 10;
+    this.plugin._concMax = maxConc;
+    this.plugin._concLimit = maxConc;
+    this.plugin._okStreak = 0;
+    this.plugin._rateLimitStreak = 0;
+    this.plugin._throttleUntil = 0;
+    this.plugin._onThrottleWait = () => this.setProgressText(this.t('downloading_throttle'));
+    // 心跳状态行：每秒刷新当前活动（连接中计时/限流降速/取消中），请求卡住也能看出任务还活着
+    const startTs = Date.now();
+    this.heartbeat = setInterval(() => {
+      if (this.plugin._cancelAll) {
+        this.setProgressText(this.t('btn_canceling'));
+      } else if ((this.plugin._throttleUntil || 0) > Date.now()) {
+        this.setProgressText(this.t('downloading_throttle'));
+      } else if (done === 0) {
+        this.setProgressText(this.t('downloading_waiting', { secs: Math.round((Date.now() - startTs) / 1000) }));
       }
+    }, 1000);
+    // 并发 worker 池：worker 数固定为平台上限，实际并发由 _concLimit 动态闸门控制；
+    // 点取消后停止派新任务
+    const worker = async (slot) => {
+      while (cursor < targets.length && !this.abort) {
+        // 闸门：槽位号 >= 当前允许并发数时待命等待（限流降速时多出的 worker 挂起）
+        if (slot >= this.plugin._concLimit) {
+          await new Promise((r) => setTimeout(r, 400));
+          continue;
+        }
+        const e = targets[cursor++];
+        try {
+          const buf = await this.plugin.downloadWithRetry(this.meta, e);
+          // writeBinary 不会自动创建目录：先逐级确保父目录存在（否则新子目录下全部下载失败）
+          const slash = e.localPath.lastIndexOf('/');
+          if (slash > 0) await this.ensureDir(e.localPath.slice(0, slash));
+          await this.app.vault.adapter.writeBinary(e.localPath, buf);
+          ok++;
+        } catch (err) {
+          if (this.plugin._cancelAll || this.abort) {
+            // 用户取消导致的中断：不计失败、不弹失败通知
+            done++;
+            continue; // 循环条件检测到 abort 后退出
+          }
+          console.error('[' + PLUGIN_ID + '] download failed:', e.rel, err);
+          failed.push(e.rel);
+          if (err && err.code === 'rate_limit_dead') {
+            // 配额型限流耗尽：立即中止整个队列（已下载部分保留），避免其余 500+ 文件继续空转
+            this.abort = true;
+            this.abortReason = 'rate_limit';
+          }
+          if (!firstError) {
+            firstError = (err && err.message) || String(err);
+            // 首个失败立刻暴露，避免「进度在跑但文件没落盘」的假下载观感
+            new Notice(this.plugin.t('notice_first_fail', { name: e.rel, reason: firstError.slice(0, 80) }), 6000);
+          }
+        }
+        done++;
+        this.setProgress(done, targets.length, e.rel);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: maxConc }, (_, i) => worker(i))
+    );
+    clearInterval(this.heartbeat); // 心跳停止
+    this.plugin._onThrottleWait = null; // 下载已结束，摘除限流提示回调
+    this.plugin._cancelAll = false;
+    this.plugin._activeAbort = null;
+    if (this.plugin._statusEl) this.plugin._statusEl.setText('');
+    if (this.bgNotice) { this.bgNotice.hide(); this.bgNotice = null; } // 后台通知收尾
+
+    // 中止（用户取消 或 配额耗尽）：保留已下载部分（增量语义，下次拉取自动跳过）
+    if (this.abort) {
+      const key = this.abortReason === 'rate_limit' ? 'notice_rate_limit_abort' : 'notice_aborted';
+      new Notice(this.t(key, { done: ok + failed.length, total: targets.length }), 6000);
+      this.abortReason = '';
+      this.busy = false;
+      this.plugin._downloadBusy = false;
+      this.downloadBtn.setDisabled(false);
+      if (this.cancelBtn) this.cancelBtn.setButtonText(this.t('btn_cancel'));
+      return;
     }
-    this.setProgress(targets.length, targets.length, '');
 
     if (failed.length === 0) {
       new Notice(this.t('notice_done', { n: ok }), 3000);
       this.busy = false;
+      this.plugin._downloadBusy = false;
       this.close();
     } else {
       new Notice(this.t('notice_failed', { ok, fail: failed.length, names: failed.slice(0, 3).join(', '), reason: firstError.slice(0, 120) }), 6000);
       this.busy = false;
+      this.plugin._downloadBusy = false;
       this.downloadBtn.setDisabled(false);
     }
   }

@@ -100,6 +100,11 @@
   word-break: break-all;
 }
 
+/* 后台下载常驻通知里的取消按钮 */
+.xu-gp-bg-cancel {
+  margin-left: 8px;
+}
+
 .xu-gp-footer .setting-item {
   border: none;
   padding: 8px 0 0;

@@ -1,7 +1,7 @@
 {
   "id": "xu-git-pull",
   "name": "XU Git Pull",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "minAppVersion": "1.13.0",
   "description": "远程资料拉取：从 GitHub 公开/私有仓库拉取指定分支或提交的文件到本地 vault，差异预览后一键覆盖，手机平板单向同步资料.",
   "author": "旭说",
