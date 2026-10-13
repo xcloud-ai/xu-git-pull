@@ -332,6 +332,27 @@ class GitPullPlugin extends Plugin {
     return pf.apiBase;
   }
 
+  /** GitCode 的 tree API 会分页（默认 20 条/页，且目录排在文件前）；GitHub/Gitee 单次返回全量 */
+  paginatesTree() {
+    return (this.settings.platform || 'github') === 'gitcode';
+  }
+
+  /** 取完整文件树：统一入口，内部按平台处理分页差异 */
+  async fetchTreeAll(owner, repo, ref) {
+    const base = this.apiBase() + '/repos/' + owner + '/' + repo + '/git/trees/' + encodeURIComponent(ref);
+    if (!this.paginatesTree()) {
+      return this.apiGetJson(base + '?recursive=1');
+    }
+    const merged = [];
+    for (let page = 1; page <= 50; page++) {
+      const d = await this.apiGetJson(base + '?recursive=1&per_page=100&page=' + page);
+      const batch = Array.isArray(d.tree) ? d.tree : [];
+      merged.push(...batch);
+      if (batch.length < 100) break;
+    }
+    return { tree: merged, truncated: false };
+  }
+
   /** 当前平台的令牌（按平台独立存储，切换平台互不影响） */
   token() {
     const t = this.settings.tokens || {};
@@ -495,8 +516,7 @@ class GitPullPlugin extends Plugin {
       const info = await this.apiGetJson(this.apiBase() + '/repos/' + owner + '/' + repo);
       ref = info.default_branch || 'main';
     }
-    const tree = await this.apiGetJson(this.apiBase() + '/repos/' + owner + '/' + repo +
-      '/git/trees/' + encodeURIComponent(ref) + '?recursive=1');
+    const tree = await this.fetchTreeAll(owner, repo, ref);
     const folders = (tree.tree || [])
       .filter((it) => it.type === 'tree')
       .map((it) => it.path)
@@ -541,9 +561,7 @@ class GitPullPlugin extends Plugin {
         const info = await this.apiGetJson(this.apiBase() + '/repos/' + cfg.owner + '/' + cfg.repo);
         ref = info.default_branch || 'main';
       }
-      const treeUrl = this.apiBase() + '/repos/' + cfg.owner + '/' + cfg.repo +
-        '/git/trees/' + encodeURIComponent(ref) + '?recursive=1';
-      const tree = await this.apiGetJson(treeUrl);
+      const tree = await this.fetchTreeAll(cfg.owner, cfg.repo, ref);
 
       if (tree.truncated) {
         notice.hide();
