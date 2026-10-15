@@ -84,6 +84,8 @@ const I18N = {
     setting_include_obsidian_desc: '默认关闭（排除 .obsidian/，避免覆盖本机插件与外观配置）。需要同步插件配置时手动开启。',
     setting_exclude: '额外排除规则（每行一条 glob）',
     setting_exclude_desc: '始终排除 .git/ 与 .trash/；此处可追加，** 匹配任意层级目录，* 匹配单层名称',
+    setting_rate: '限速：每分钟请求数',
+    setting_rate_desc: '0 = 全速（默认）。平台限流（如 GitCode 提示 429）时建议设 30-60，下载更稳但变慢',
     action_pull: '立即检查并拉取',
     action_pull_desc: '获取远程文件清单，比对后覆盖更新',
     setting_token: '{name} Token',
@@ -169,6 +171,8 @@ const I18N = {
     setting_include_obsidian_desc: 'Off by default (excludes .obsidian/ to avoid overwriting local plugins and appearance). Turn on to sync plugin config.',
     setting_exclude: 'Extra exclude patterns (one glob per line)',
     setting_exclude_desc: '.git/ and .trash/ are always excluded. Add more here. ** matches any depth, * a single segment.',
+    setting_rate: 'Throttle: requests per minute',
+    setting_rate_desc: '0 = full speed (default). If the platform rate-limits (e.g. GitCode 429), try 30-60 for steadier downloads',
     action_pull: 'Check and pull now',
     action_pull_desc: 'Fetch the remote file list, compare, and overwrite',
     setting_token: '{name} token',
@@ -238,6 +242,7 @@ const DEFAULT_SETTINGS = {
   localPath: '',
   includeObsidian: false,
   exclude: '',
+  ratePerMin: 0, // 每分钟请求数限速；0 = 全速（默认）。平台限流（如 GitCode 429）时建议 30-60
   tokens: { github: '', gitcode: '', gitee: '' },
   profiles: { github: defaultProfile(), gitcode: defaultProfile(), gitee: defaultProfile() },
 };
@@ -455,7 +460,34 @@ class GitPullPlugin extends Plugin {
     };
   }
 
+  /** 全局请求节流阀：可选限速——设置「每分钟请求数」（0 = 全速默认）。
+   *  撞 429 后自动拉长间隔（学习）；按 250ms 切片等待并检查取消；同步占坑防并发放行 */
+  async _rateGate() {
+    const key = this.settings.platform + ':' + (this.settings.ratePerMin || 0);
+    if (this._rateKey !== key) {
+      this._rateKey = key;
+      const rpm = Number(this.settings.ratePerMin) || 0;
+      this._minInterval = rpm > 0 ? Math.round(60000 / rpm) : 0;
+    }
+    const iv = this._minInterval || 0;
+    if (iv <= 0) return;
+    for (;;) {
+      const wait = (this._lastReqTs || 0) + iv - Date.now();
+      if (wait <= 0) {
+        this._lastReqTs = Date.now();
+        return;
+      }
+      await new Promise((r) => setTimeout(r, Math.min(wait, 250)));
+      if (this._cancelAll) {
+        const e = new Error('aborted');
+        e.code = 'aborted';
+        throw e;
+      }
+    }
+  }
+
   async apiGetJson(url) {
+    await this._rateGate();
     let res;
     try {
       res = await requestUrl({ url, method: 'GET', headers: this.headers() });
@@ -598,6 +630,7 @@ class GitPullPlugin extends Plugin {
     }
 
     const notice = new Notice(this.t('notice_checking'), 0);
+    this._rateKey = null; // 每轮拉取按当前设置重新初始化限速
     let ref = cfg.ref;
     try {
       if (!ref) {
@@ -703,11 +736,17 @@ class GitPullPlugin extends Plugin {
         }
         const buf = await this.downloadWithTimeout(meta, entry);
         this._rateLimitStreak = 0; // 任一请求成功即视为限流解除，重新计数
-        // 自适应并发：连续 20 个成功且未达平台上限时逐步回升
+        // 自适应调节：连续 20 个成功且未达平台上限时并发回升；连续 30 个成功后节流间隔微降（下限 1.1s）
         this._okStreak = (this._okStreak || 0) + 1;
-        if (this._okStreak >= 20 && this._concLimit < (this._concMax || 4)) {
-          this._concLimit++;
+        if (this._okStreak >= 20 && this._concLimit < (this._concMax || 4)) this._concLimit++;
+        if (this._okStreak >= 30) {
           this._okStreak = 0;
+          // 回落到用户设置值；全速用户撞过 429 后本轮会话保持 ≥1 请求/秒（1 秒间隔），避免恢复全速立刻再撞
+          const rpm = Number(this.settings.ratePerMin) || 0;
+          const floor = rpm > 0 ? Math.round(60000 / rpm) : 1000;
+          if ((this._minInterval || 0) > floor) {
+            this._minInterval = Math.max(floor, Math.round(this._minInterval * 0.9));
+          }
         }
         return buf;
       } catch (err) {
@@ -718,6 +757,8 @@ class GitPullPlugin extends Plugin {
           this._rateLimitStreak = (this._rateLimitStreak || 0) + 1;
           const backoff = Math.min(3000 * Math.pow(2, attempt), 60000);
           this._throttleUntil = Math.max(this._throttleUntil || 0, Date.now() + backoff);
+          // 节流间隔学习：拉长稳态速率（全速时从 1 请求/秒起步，×1.5 封顶 5s），从源头降低单位时间请求量
+          this._minInterval = Math.min(5000, Math.round(Math.max(this._minInterval || 0, 1000) * 1.5));
           // 自适应并发减半（下限 1）：与退避窗口配合，减少窗口内的在途请求
           this._concLimit = Math.max(1, Math.floor((this._concLimit || 4) / 2));
           // 连续 15 次 429：判定配额窗口内退避无意义（分钟级起步），主动中止整个队列避免长时间假死
@@ -751,6 +792,7 @@ class GitPullPlugin extends Plugin {
     const pf = PLATFORMS.find((x) => x.id === this.settings.platform) || PLATFORMS.find((x) => x.available);
     const token = this.token();
     if (token || pf.id !== 'github') {
+      await this._rateGate();
       const url = this.apiBase() + '/repos/' + meta.owner + '/' + meta.repo + '/git/blobs/' + entry.sha;
       const res = await requestUrl({ url, method: 'GET', headers: token ? this.headers() : {} });
       return base64ToArrayBuffer(res.json.content);
@@ -876,6 +918,7 @@ class PullPreviewModal extends Modal {
       return;
     }
     this.plugin._downloadBusy = true;
+    this.plugin._rateKey = null; // 每轮下载按当前设置重新初始化限速（清除上轮 429 学习值）
     this.busy = true;
     this.downloadBtn.setDisabled(true);
     this.progressWrap.show();
@@ -1096,6 +1139,21 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_remote_path'), desc: p.t('setting_remote_path_desc'), render: (setting) => this.renderFolderSelect(setting) },
           // 7. 本地目录仍用原生选择器
           { name: p.t('setting_local_path'), desc: p.t('setting_local_path_desc'), control: { type: 'folder', key: 'localPath', placeholder: '/', includeRoot: true } },
+          // 8. 限速：每分钟请求数（0 = 全速），平台限流时手动调低
+          {
+            name: p.t('setting_rate'), desc: p.t('setting_rate_desc'),
+            render: (setting) => setting.addText((text) => {
+              text.inputEl.type = 'number';
+              text.inputEl.min = '0';
+              text.setPlaceholder('0');
+              text.setValue(String(p.settings.ratePerMin || 0));
+              text.onChange((v) => {
+                p.settings.ratePerMin = Math.max(0, Math.floor(Number(v) || 0));
+                void p.saveSettings();
+              });
+              text.inputEl.addEventListener('blur', () => { this.plugin._rateKey = null; });
+            }),
+          },
         ],
       },
       {
