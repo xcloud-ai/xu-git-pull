@@ -21,6 +21,17 @@ const GIT_BASES = { github: 'https://github.com', gitcode: 'https://gitcode.com'
 // LightningFS（IndexedDB）内的克隆工作目录与库名
 const CLONE_FS_DB = 'xu-git-pull-fs';
 const CLONE_DIR = '/repo';
+// 整仓克隆的仓库体积上限（MB，repo.size 字段为 KB 换算）：超过自动切增量同步（tree 清单 + 逐文件下载，内存 O(单文件)）。
+// 桌面 500MB：Electron V8 堆 ~4GB，克隆峰值 ≈ 2×pack 实测 275MB 仓 62s 稳定，500MB 留余量；
+// 移动端 100MB：安卓 WebView 堆 256MB（低端）~512MB（主流），100MB 仓峰值 ~200MB 低端机也安全（275MB 实测 OOM 闪退）
+const DESKTOP_CLONE_MAX_MB = 500;
+const MOBILE_CLONE_MAX_MB = 100;
+const cloneMaxMB = () => (Platform.isMobile ? MOBILE_CLONE_MAX_MB : DESKTOP_CLONE_MAX_MB);
+// 增量模式默认限速（每分钟请求数）：GitCode blob API 实测 ~50 个/50s 窗口即限流，留安全余量
+const INCREMENTAL_RPM = 30;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/** base64 → Uint8Array（git blobs API 返回 base64 内容；atob 在桌面/移动端 WebView 均内置） */
+const b64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 
 /** isomorphic-git HTTP 适配器工厂：底层换用 Obsidian requestUrl（桌面/手机统一网络栈，绕 CORS）。
  *  认证在适配器层注入 Basic 头（getRemoteInfo 不支持 onAuth 回调，统一在此处理三平台凭据）；
@@ -97,8 +108,14 @@ const I18N = {
     notice_rate_limited: 'API 限流中，请稍后重试',
     notice_cancelling: '取消中…（克隆完成后跳过写入）',
     statusbar_cancel_hint: '点击取消拉取',
-    mobile_size_warn: '该仓库约 {mb}MB，超出移动端内存安全范围（克隆过程内存不足会导致 Obsidian 闪退）。建议在手机上改用只含笔记的轻量子仓库，或到桌面端拉取。',
-    mobile_fail_hint: '移动端内存有限，大仓库建议使用只含笔记的轻量子仓库（可把需要的目录单独建仓推送）。',
+    incremental_hint: '仓库约 {mb}MB，超出本设备整仓克隆能力（内存限制），已切换为增量同步：只下载有变更的文件，支持断点续传',
+    incr_tree: '增量同步：获取远程文件清单…',
+    incr_truncated: '远程文件清单不完整（仓库过大），增量同步中止，请改用桌面端',
+    incr_start: '增量同步：{n}/{total} 个文件有变更',
+    incr_none: '增量同步：无变更（{total} 个文件均为最新）',
+    incr_wait: '触发平台限流，等待 {s}s 后自动继续…',
+    incr_done: '增量同步完成：更新 {n} 个文件（{m} 个无变更跳过），耗时 {s}s',
+    incr_skipped: '已跳过 {n} 个超大文件（>20MB，移动端内存限制）：{list}',
     setting_title: 'XU Git Pull（远程资料拉取）',
     setting_header_desc: '从远程仓库（支持私有库）单向拉取文件到本 vault：整仓克隆后按过滤规则覆盖写入，适合手机/平板只看资料的场景。只增改，不删除本地文件。',
     setting_language: '界面语言',
@@ -167,8 +184,14 @@ const I18N = {
     notice_rate_limited: 'API rate limited — please retry later',
     notice_cancelling: 'Cancelling… (writing will be skipped)',
     statusbar_cancel_hint: 'Click to cancel the pull',
-    mobile_size_warn: 'This repo is ~{mb}MB — beyond the mobile memory budget (cloning it may crash Obsidian). Use a lightweight notes-only repo on mobile, or pull on desktop.',
-    mobile_fail_hint: 'Mobile devices have limited memory; use a lightweight notes-only sub-repo for large repos.',
+    incremental_hint: 'Repo is ~{mb}MB — beyond full-clone capability on this device (memory limit). Switched to incremental sync: only changed files are downloaded, with resume support.',
+    incr_tree: 'Incremental sync: fetching remote file list…',
+    incr_truncated: 'Remote file list incomplete (repo too large) — incremental sync aborted. Use desktop instead.',
+    incr_start: 'Incremental sync: {n}/{total} files changed',
+    incr_none: 'Incremental sync: nothing changed ({total} files up to date)',
+    incr_wait: 'Rate limited — retrying in {s}s…',
+    incr_done: 'Incremental sync done: {n} updated ({m} unchanged), took {s}s',
+    incr_skipped: 'Skipped {n} oversized file(s) (>20MB, mobile memory limit): {list}',
     setting_title: 'XU Git Pull',
     setting_header_desc: 'One-way pull from a remote repo (private supported) into this vault: full clone, then filtered overwrite — ideal for read-only phones/tablets. Files are added/updated, never deleted.',
     setting_language: 'UI language',
@@ -482,20 +505,6 @@ class GitPullPlugin extends Plugin {
     const refLabel = cfg.ref || this.t('ref_default');
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
 
-    // ①.5 移动端大仓预检：requestUrl 全量响应 + isogit fetch 双份内存，安卓 WebView 堆有限（>150MB 大概率闪退）
-    if (Platform.isMobile) {
-      try {
-        const info = await this.apiGetJson(this.apiBase() + '/repos/' + cfg.owner + '/' + cfg.repo);
-        const sizeMB = Math.round((Number(info && info.size) || 0) / 1024);
-        if (sizeMB > 150) {
-          throw Object.assign(new Error(this.t('mobile_size_warn', { mb: sizeMB })), { code: 'mobile_size' });
-        }
-      } catch (e) {
-        if (e.code === 'mobile_size') throw e;
-        // 预检失败（网络/API 差异拿不到 size）不阻断克隆
-      }
-    }
-
     // ② 清理旧克隆 → 浅克隆（5 分钟超时兜底，心跳显示已用时）。
     //    noCheckout：不写工作区（省一份 IndexedDB 全仓写入），克隆后从提交树逐 blob 读出再过滤写盘
     notice.setMessage(this.t('clone_verified', { repo: cfg.owner + '/' + cfg.repo, ref: refLabel }));
@@ -566,6 +575,153 @@ class GitPullPlugin extends Plugin {
     const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
     notice.hide();
     new Notice(this.t('clone_ok', { n: written, m: all.length - targets.length, s: secs }), 6000);
+  }
+
+  /** 增量同步（移动端大仓专用）：tree API 拿全量清单 → 与本地 manifest 按 blob sha 对比 → 限速逐文件下载。
+   *  内存占用 O(单文件)，永不 OOM；manifest 记在 vault/.xu-git-pull/（换设备可续传），每 20 个文件落盘断点。 */
+  async pullIncremental(cfg, notice) {
+    const owner = cfg.owner;
+    const repo = cfg.repo;
+    const refName = cfg.ref || 'HEAD';
+    // ref 校验：与克隆模式同源（ls-remote），分支不存在给清晰错误
+    const url = this.gitRemoteUrl(owner, repo);
+    const { refs } = await this.verifyRemote(url);
+    if (cfg.ref && !(refs.heads && refs.heads[cfg.ref] !== undefined)) {
+      throw Object.assign(new Error(this.t('notice_ref_not_found', { ref: cfg.ref })), { code: 'verify' });
+    }
+    if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
+
+    // ① 全量文件清单（tree API：GitHub/Gitee 单请求，GitCode 分页自动翻页合并）
+    notice.setMessage(this.t('incr_tree'));
+    const data = await this.fetchTreeAll(owner, repo, refName);
+    if (data.truncated) throw new Error(this.t('incr_truncated'));
+
+    // ② 过滤（子目录/排除 glob/.obsidian 开关），与克隆模式同规则
+    const prefix = cfg.remotePath ? cfg.remotePath.replace(/\/+$/, '') + '/' : '';
+    const targets = [];
+    for (const it of data.tree || []) {
+      if (it.type !== 'blob') continue;
+      const p = String(it.path || '');
+      if (p === '' || p.startsWith('.git/') || p.startsWith('.trash/')) continue;
+      if (p.split('/').includes('..')) continue;
+      const key = prefix ? (p.startsWith(prefix) ? p.slice(prefix.length) : null) : p;
+      if (key === null || key === '') continue;
+      if (key === '.obsidian' || key.startsWith('.obsidian/')) {
+        if (!this.settings.includeObsidian) continue;
+      }
+      if (matchAny(key, cfg.matchers)) continue;
+      targets.push({ key, path: p, sha: it.sha, size: Number(it.size) || 0 });
+    }
+
+    // ③ 本地 manifest（上次成功下载的 path→sha 快照；换分支则重置全量重下）
+    const mKey = normalizePath('.xu-git-pull/' + (this.settings.platform || 'github') + '-' + owner + '-' + repo + '.json');
+    let manifest = { ref: refName, files: {} };
+    try {
+      const prev = JSON.parse(await this.app.vault.adapter.read(mKey));
+      if (prev && prev.ref === refName && prev.files && typeof prev.files === 'object') manifest = prev;
+    } catch (e) { /* 无清单 → 全量 */ }
+    const changed = targets.filter((t) => manifest.files[t.path] !== t.sha);
+    const t0 = Date.now();
+
+    if (changed.length === 0) {
+      notice.hide();
+      new Notice(this.t('incr_none', { total: targets.length }), 8000);
+      return;
+    }
+    notice.setMessage(this.t('incr_start', { n: changed.length, total: targets.length }));
+    if (this._statusEl) this._statusEl.setText('⬇ 0/' + changed.length);
+
+    // ④ 限速逐文件下载（git blobs API 三平台同构；每 20 个文件落盘 manifest 断点）
+    const gap = Math.ceil(60000 / (this._incrRpm || INCREMENTAL_RPM));
+    const blobBase = this.apiBase() + '/repos/' + owner + '/' + repo + '/git/blobs/';
+    const BIG_FILE = 20 * 1024 * 1024; // base64 解码峰值 ≈ 3×文件大小，安卓 WebView 单文件 >20MB 有 OOM 风险
+    let lastTs = 0;
+    let done = 0;
+    let dirty = 0;
+    const skipped = [];
+    for (const t of changed) {
+      // 超大单文件：跳过（也记 sha，避免每次拉取重复提示）；需要该文件时去桌面端拉取
+      if (t.size > BIG_FILE) {
+        skipped.push(t.key);
+        manifest.files[t.path] = t.sha;
+        continue;
+      }
+      if (this._cancelAll) {
+        if (dirty > 0) await this.saveManifestSafe(mKey, manifest);
+        const e = new Error('aborted'); e.code = 'aborted'; throw e;
+      }
+      const now = Date.now();
+      if (lastTs > 0 && now - lastTs < gap) await sleep(gap - (now - lastTs));
+      lastTs = Date.now();
+      let bytes = null;
+      let lastErr = null;
+      let tooBig = false;
+      for (let attempt = 0; attempt <= 5; attempt++) {
+        if (this._cancelAll) {
+          if (dirty > 0) await this.saveManifestSafe(mKey, manifest);
+          const e = new Error('aborted'); e.code = 'aborted'; throw e;
+        }
+        try {
+          const info = await this.apiGetJson(blobBase + t.sha);
+          if (info && typeof info.content === 'string' && info.encoding === 'base64') {
+            // 双保险：GitCode 的 tree 响应无 size 字段（大文件拦不住），按 base64 长度兜底（20MB ≈ 27MB base64）
+            if (info.content.length > BIG_FILE * 1.4) { tooBig = true; break; }
+            bytes = b64ToBytes(info.content.replace(/\s+/g, ''));
+          }
+          lastErr = null;
+          break;
+        } catch (err) {
+          lastErr = err;
+          // 限流（403 配额/429）自动等 60s 重试；认证/仓库错误直接失败
+          if (attempt < 5 && (err.code === 'rate_limited' || err.status === 429)) {
+            notice.setMessage(this.t('incr_wait', { s: 60 }));
+            if (this._statusEl) this._statusEl.setText('⬇ ' + done + '/' + changed.length + ' (等待重试)');
+            await sleep(60000);
+            notice.setMessage(this.t('incr_start', { n: changed.length, total: targets.length }));
+            continue;
+          }
+          break;
+        }
+      }
+      if (tooBig) {
+        skipped.push(t.key);
+        manifest.files[t.path] = t.sha;
+        continue;
+      }
+      if (!bytes) {
+        if (lastErr) throw lastErr;
+        throw new Error(this.t('clone_fail', { reason: 'blob ' + t.path + ' (empty content)' }));
+      }
+      const localPath = normalizePath(cfg.localPath ? cfg.localPath + '/' + t.key : t.key);
+      await this.ensureDirFor(localPath);
+      await this.app.vault.adapter.writeBinary(localPath, bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
+      manifest.files[t.path] = t.sha;
+      dirty++;
+      done++;
+      if (dirty >= 20) { await this.saveManifestSafe(mKey, manifest); dirty = 0; }
+      notice.setMessage(this.t('incr_start', { n: changed.length, total: targets.length }) + ' — ' + done + '/' + changed.length);
+      if (this._statusEl) this._statusEl.setText('⬇ ' + done + '/' + changed.length);
+    }
+    await this.saveManifestSafe(mKey, manifest);
+    const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
+    notice.hide();
+    new Notice(this.t('incr_done', { n: done, m: targets.length - changed.length, s: secs }), 8000);
+    if (skipped.length > 0) {
+      const list = skipped.slice(0, 3).join('、') + (skipped.length > 3 ? ' 等' : '');
+      new Notice(this.t('incr_skipped', { n: skipped.length, list }), 8000);
+    }
+  }
+
+  /** manifest 落盘（先建 .xu-git-pull/ 目录） */
+  async saveManifestSafe(key, obj) {
+    const dir = key.split('/').slice(0, -1).join('/');
+    try {
+      if (dir && !(await this.app.vault.adapter.exists(dir))) await this.app.vault.adapter.mkdir(dir);
+      await this.app.vault.adapter.write(key, JSON.stringify(obj));
+    } catch (e) {
+      // manifest 写失败不中断同步（下次全量对比，功能不受损）
+      console.error('[' + PLUGIN_ID + '] manifest save failed:', e);
+    }
   }
 
 
@@ -762,6 +918,21 @@ class GitPullPlugin extends Plugin {
       this._statusEl.setText('⬇ ' + this.t('clone_checking'));
     }
     try {
+      // 仓库体积预检（全平台）：repo.size 单位 KB；超过平台阈值（桌面 500MB / 移动端 100MB）切增量同步
+      let sizeMB = 0;
+      try {
+        const info = await this.apiGetJson(this.apiBase() + '/repos/' + cfg.owner + '/' + cfg.repo);
+        sizeMB = Math.round((Number(info && info.size) || 0) / 1024);
+      } catch (e) {
+        // 认证/仓库问题直接抛（增量/克隆都过不去）；仅 size 拿不到时按克隆走
+        if (e.code === 'unauthorized' || e.code === 'not_found' || e.code === 'rate_limited') throw e;
+      }
+      if (sizeMB > cloneMaxMB()) {
+        n1.setMessage(this.t('incremental_hint', { mb: sizeMB }));
+        new Notice(this.t('incremental_hint', { mb: sizeMB }), 6000);
+        await this.pullIncremental(cfg, n1);
+        return;
+      }
       await this.pullViaClone(cfg, n1);
     } catch (err) {
       n1.hide();
@@ -773,14 +944,8 @@ class GitPullPlugin extends Plugin {
         new Notice(err.message, 6000);
         return;
       }
-      if (err && err.code === 'mobile_size') {
-        new Notice(err.message, 10000);
-        return;
-      }
-      console.error('[' + PLUGIN_ID + '] clone failed:', err);
-      let reason = String((err && err.message) || err);
-      if (Platform.isMobile) reason += '\n' + this.t('mobile_fail_hint');
-      new Notice(this.t('clone_fail', { reason }), 6000);
+      console.error('[' + PLUGIN_ID + '] pull failed:', err);
+      new Notice(this.t('clone_fail', { reason: String((err && err.message) || err) }), 6000);
     } finally {
       this._pullBusy = false;
       this._activeAbort = null;
