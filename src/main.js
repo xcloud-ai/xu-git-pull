@@ -2,7 +2,7 @@
 'use strict';
 
 const obsidianApi = require('obsidian');
-const { Plugin, Notice, Modal, Setting, PluginSettingTab, requestUrl, normalizePath } = obsidianApi;
+const { Plugin, Notice, Modal, Setting, PluginSettingTab, requestUrl, normalizePath, Platform } = obsidianApi;
 
 // isomorphic-git bundle（v1.44.2 + LightningFS 4.10.3）
 // 源码形态：静态 require 上级目录的 isogit.bundle.js（esbuild 相对 src/ 解析；Node e2e 沙盒可 mock）；
@@ -97,6 +97,8 @@ const I18N = {
     notice_rate_limited: 'API 限流中，请稍后重试',
     notice_cancelling: '取消中…（克隆完成后跳过写入）',
     statusbar_cancel_hint: '点击取消拉取',
+    mobile_size_warn: '该仓库约 {mb}MB，超出移动端内存安全范围（克隆过程内存不足会导致 Obsidian 闪退）。建议在手机上改用只含笔记的轻量子仓库，或到桌面端拉取。',
+    mobile_fail_hint: '移动端内存有限，大仓库建议使用只含笔记的轻量子仓库（可把需要的目录单独建仓推送）。',
     setting_title: 'XU Git Pull（远程资料拉取）',
     setting_header_desc: '从远程仓库（支持私有库）单向拉取文件到本 vault：整仓克隆后按过滤规则覆盖写入，适合手机/平板只看资料的场景。只增改，不删除本地文件。',
     setting_language: '界面语言',
@@ -165,6 +167,8 @@ const I18N = {
     notice_rate_limited: 'API rate limited — please retry later',
     notice_cancelling: 'Cancelling… (writing will be skipped)',
     statusbar_cancel_hint: 'Click to cancel the pull',
+    mobile_size_warn: 'This repo is ~{mb}MB — beyond the mobile memory budget (cloning it may crash Obsidian). Use a lightweight notes-only repo on mobile, or pull on desktop.',
+    mobile_fail_hint: 'Mobile devices have limited memory; use a lightweight notes-only sub-repo for large repos.',
     setting_title: 'XU Git Pull',
     setting_header_desc: 'One-way pull from a remote repo (private supported) into this vault: full clone, then filtered overwrite — ideal for read-only phones/tablets. Files are added/updated, never deleted.',
     setting_language: 'UI language',
@@ -443,20 +447,6 @@ class GitPullPlugin extends Plugin {
     }
   }
 
-  /** 收集目录下所有文件的相对路径（skip 指定顶层条目，如 .git） */
-  async fsCollect(fsp, root, rel, out, skip) {
-    let entries;
-    try { entries = await fsp.promises.readdir(rel ? root + '/' + rel : root); } catch (e) { return; }
-    for (const e of entries) {
-      if (rel === '' && skip && skip.includes(e)) continue;
-      const child = rel ? rel + '/' + e : e;
-      let st;
-      try { st = await fsp.promises.stat(root + '/' + child); } catch (e2) { continue; }
-      if (st.isDirectory()) await this.fsCollect(fsp, root, child, out, skip);
-      else out.push(child);
-    }
-  }
-
   /** vault 目录逐级创建（adapter.mkdir 只建单级） */
   async ensureDirFor(localPath) {
     const parts = localPath.split('/').filter(Boolean);
@@ -492,7 +482,22 @@ class GitPullPlugin extends Plugin {
     const refLabel = cfg.ref || this.t('ref_default');
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
 
-    // ② 清理旧克隆 → 浅克隆（5 分钟超时兜底，心跳显示已用时）
+    // ①.5 移动端大仓预检：requestUrl 全量响应 + isogit fetch 双份内存，安卓 WebView 堆有限（>150MB 大概率闪退）
+    if (Platform.isMobile) {
+      try {
+        const info = await this.apiGetJson(this.apiBase() + '/repos/' + cfg.owner + '/' + cfg.repo);
+        const sizeMB = Math.round((Number(info && info.size) || 0) / 1024);
+        if (sizeMB > 150) {
+          throw Object.assign(new Error(this.t('mobile_size_warn', { mb: sizeMB })), { code: 'mobile_size' });
+        }
+      } catch (e) {
+        if (e.code === 'mobile_size') throw e;
+        // 预检失败（网络/API 差异拿不到 size）不阻断克隆
+      }
+    }
+
+    // ② 清理旧克隆 → 浅克隆（5 分钟超时兜底，心跳显示已用时）。
+    //    noCheckout：不写工作区（省一份 IndexedDB 全仓写入），克隆后从提交树逐 blob 读出再过滤写盘
     notice.setMessage(this.t('clone_verified', { repo: cfg.owner + '/' + cfg.repo, ref: refLabel }));
     const fsp = this.cloneFs();
     await this.fsRmrf(fsp, CLONE_DIR);
@@ -512,7 +517,7 @@ class GitPullPlugin extends Plugin {
       await Promise.race([
         isogit.git.clone({
           fs: fsp, http: this.gitHttp(), url, dir: CLONE_DIR,
-          depth: 1, singleBranch: true, ref,
+          depth: 1, singleBranch: true, ref, noCheckout: true,
         }),
         // 超时兜底：timer 必须清理，否则成功后仍会在 5 分钟时 reject（泄漏 + unhandled rejection）
         new Promise((_, reject) => {
@@ -524,25 +529,36 @@ class GitPullPlugin extends Plugin {
       if (timeoutId) clearTimeout(timeoutId);
     }
 
-    // ③ 遍历工作区 → 过滤（.obsidian/exclude/子目录）→ 逐文件写 vault（精确进度）
+    // ③ 遍历提交树（noCheckout 模式无工作区）→ 过滤 → 逐 blob 读对象写 vault（精确进度）
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
-    const prefix = cfg.remotePath ? cfg.remotePath.replace(/\/+$/, '') + '/' : '';
+    const headOid = await isogit.git.resolveRef({ fs: fsp, dir: CLONE_DIR, ref: 'HEAD' });
+    const commit = await isogit.git.readCommit({ fs: fsp, dir: CLONE_DIR, oid: headOid });
     const all = [];
-    await this.fsCollect(fsp, CLONE_DIR, '', all, ['.git']);
-    const targets = all.filter((rel) => {
-      if (rel.split('/').includes('..')) return false; // 防越界
-      const key = prefix ? (rel.startsWith(prefix) ? rel.slice(prefix.length) : null) : rel;
+    const walkTree = async (oid, prefix) => {
+      const { tree } = await isogit.git.readTree({ fs: fsp, dir: CLONE_DIR, oid });
+      for (const it of tree) {
+        const full = prefix ? prefix + '/' + it.path : it.path;
+        if (it.type === 'tree') await walkTree(it.oid, full);
+        else if (it.type === 'blob') all.push({ path: full, oid: it.oid });
+        // symlink(120000)/gitlink(160000 子模块) 不落盘
+      }
+    };
+    await walkTree(commit.commit.tree, '');
+    const prefix = cfg.remotePath ? cfg.remotePath.replace(/\/+$/, '') + '/' : '';
+    const targets = all.filter((it) => {
+      if (it.path.split('/').includes('..')) return false; // 防越界
+      const key = prefix ? (it.path.startsWith(prefix) ? it.path.slice(prefix.length) : null) : it.path;
       if (key === null || key === '') return false;
       return !matchAny(key, cfg.matchers);
     });
     let written = 0;
-    for (const rel of targets) {
+    for (const it of targets) {
       if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
-      const key = prefix ? rel.slice(prefix.length) : rel;
+      const key = prefix ? it.path.slice(prefix.length) : it.path;
       const localPath = normalizePath(cfg.localPath ? cfg.localPath + '/' + key : key);
-      const buf = await fsp.promises.readFile(CLONE_DIR + '/' + rel);
+      const { blob } = await isogit.git.readBlob({ fs: fsp, dir: CLONE_DIR, oid: it.oid });
       await this.ensureDirFor(localPath);
-      await this.app.vault.adapter.writeBinary(localPath, buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength));
+      await this.app.vault.adapter.writeBinary(localPath, blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength));
       written++;
       notice.setMessage(this.t('write_progress', { i: written, n: targets.length }));
       if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('write_progress', { i: written, n: targets.length }));
@@ -757,8 +773,14 @@ class GitPullPlugin extends Plugin {
         new Notice(err.message, 6000);
         return;
       }
+      if (err && err.code === 'mobile_size') {
+        new Notice(err.message, 10000);
+        return;
+      }
       console.error('[' + PLUGIN_ID + '] clone failed:', err);
-      new Notice(this.t('clone_fail', { reason: String((err && err.message) || err) }), 6000);
+      let reason = String((err && err.message) || err);
+      if (Platform.isMobile) reason += '\n' + this.t('mobile_fail_hint');
+      new Notice(this.t('clone_fail', { reason }), 6000);
     } finally {
       this._pullBusy = false;
       this._activeAbort = null;
