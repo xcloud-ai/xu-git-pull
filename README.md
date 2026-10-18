@@ -28,7 +28,7 @@
 - One-way only: files are added or updated, never deleted, and nothing is ever uploaded
 - Private repositories supported via a fine-grained read-only token
 - Cascading dropdowns for repository, branch and subfolder after entering a token — pick, don't type
-- Excludes `.obsidian/` by default (toggleable), always excludes `.git/` and `.trash/`, custom glob patterns supported
+- Includes `.obsidian/` by default (toggleable), always excludes `.git/` and `.trash/`, custom glob patterns supported
 - Works on desktop, iOS/iPadOS and Android; bilingual Chinese/English UI
 
 ## 适用场景与边界
@@ -120,7 +120,7 @@ The plugin is one-way: it only adds or updates local files, never uploads or del
 | 分支 | 下拉选择远程分支；留空项「默认分支（最新）」跟随仓库默认分支 |
 | 仓库内子目录 | 下拉选择后只拉取该目录；「/（整个仓库）」为默认 |
 | 本地目标目录 | 下载到 vault 中的位置，留空为 vault 根目录 |
-| 下载 .obsidian 配置目录 | 默认关闭，避免移动端配置被仓库覆盖；需要同步插件配置时手动开启 |
+| 下载 .obsidian 配置目录 | 默认开启，同步 `.obsidian/`（插件与外观配置跟随仓库）；不希望覆盖本机配置时手动关闭 |
 | 额外排除规则 | 每行一条 glob，`**` 匹配任意层级；`.git/`、`.trash/` 始终排除 |
 
 ## 命令列表
