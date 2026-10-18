@@ -109,6 +109,7 @@ const I18N = {
     notice_cancelling: '取消中…（克隆完成后跳过写入）',
     statusbar_cancel_hint: '点击取消拉取',
     incremental_hint: '仓库约 {mb}MB，超出本设备整仓克隆能力（内存限制），已切换为增量同步：只下载有变更的文件，支持断点续传',
+    incremental_hint_unknown: '当前平台无法获取仓库体积，移动端已切换为增量同步：只下载有变更的文件，支持断点续传',
     incr_tree: '增量同步：获取远程文件清单…',
     incr_truncated: '远程文件清单不完整（仓库过大），增量同步中止，请改用桌面端',
     incr_start: '增量同步：{n}/{total} 个文件有变更',
@@ -185,6 +186,7 @@ const I18N = {
     notice_cancelling: 'Cancelling… (writing will be skipped)',
     statusbar_cancel_hint: 'Click to cancel the pull',
     incremental_hint: 'Repo is ~{mb}MB — beyond full-clone capability on this device (memory limit). Switched to incremental sync: only changed files are downloaded, with resume support.',
+    incremental_hint_unknown: 'Repo size unavailable on this platform — switched to incremental sync (mobile): only changed files are downloaded, with resume support.',
     incr_tree: 'Incremental sync: fetching remote file list…',
     incr_truncated: 'Remote file list incomplete (repo too large) — incremental sync aborted. Use desktop instead.',
     incr_start: 'Incremental sync: {n}/{total} files changed',
@@ -918,18 +920,24 @@ class GitPullPlugin extends Plugin {
       this._statusEl.setText('⬇ ' + this.t('clone_checking'));
     }
     try {
-      // 仓库体积预检（全平台）：repo.size 单位 KB；超过平台阈值（桌面 500MB / 移动端 100MB）切增量同步
+      // 仓库体积预检：repo.size 单位 KB。GitCode 实测无 size 字段（None→0）→ 移动端拿不到体积时
+      // 一律走增量（安全侧：增量对任何仓内存 O(单文件)；桌面 Electron 堆大，size 缺失走克隆无碍）
       let sizeMB = 0;
+      let sizeKnown = false;
       try {
         const info = await this.apiGetJson(this.apiBase() + '/repos/' + cfg.owner + '/' + cfg.repo);
-        sizeMB = Math.round((Number(info && info.size) || 0) / 1024);
+        const kb = Number(info && info.size) || 0;
+        sizeMB = Math.round(kb / 1024);
+        sizeKnown = kb > 0;
       } catch (e) {
-        // 认证/仓库问题直接抛（增量/克隆都过不去）；仅 size 拿不到时按克隆走
+        // 认证/仓库问题直接抛（增量/克隆都过不去）；size 拿不到时按平台保守侧走
         if (e.code === 'unauthorized' || e.code === 'not_found' || e.code === 'rate_limited') throw e;
       }
-      if (sizeMB > cloneMaxMB()) {
-        n1.setMessage(this.t('incremental_hint', { mb: sizeMB }));
-        new Notice(this.t('incremental_hint', { mb: sizeMB }), 6000);
+      const overLimit = sizeKnown && sizeMB > cloneMaxMB();
+      if (overLimit || (Platform.isMobile && !sizeKnown)) {
+        const msg = sizeKnown ? this.t('incremental_hint', { mb: sizeMB }) : this.t('incremental_hint_unknown');
+        n1.setMessage(msg);
+        new Notice(msg, 6000);
         await this.pullIncremental(cfg, n1);
         return;
       }
