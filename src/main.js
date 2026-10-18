@@ -92,6 +92,11 @@ const I18N = {
     notice_aborted_simple: '已取消',
     notice_pull_busy: '拉取进行中，请等待本次完成',
     notice_isogit_missing: '克隆组件（isogit.bundle.js）缺失，请重新安装插件',
+    notice_unauthorized: 'Token 无效或权限不足（401），请检查设置中的令牌',
+    notice_repo_not_found: '仓库不存在或无权访问（404），请检查仓库名与 Token 权限',
+    notice_rate_limited: 'API 限流中，请稍后重试',
+    notice_cancelling: '取消中…（克隆完成后跳过写入）',
+    statusbar_cancel_hint: '点击取消拉取',
     setting_title: 'XU Git Pull（远程资料拉取）',
     setting_header_desc: '从远程仓库（支持私有库）单向拉取文件到本 vault：整仓克隆后按过滤规则覆盖写入，适合手机/平板只看资料的场景。只增改，不删除本地文件。',
     setting_language: '界面语言',
@@ -155,6 +160,11 @@ const I18N = {
     notice_aborted_simple: 'Cancelled',
     notice_pull_busy: 'Pull already in progress — please wait',
     notice_isogit_missing: 'Clone component (isogit.bundle.js) missing — reinstall the plugin',
+    notice_unauthorized: 'Token invalid or unauthorized (401) — check the token in settings',
+    notice_repo_not_found: 'Repository not found or access denied (404) — check the repo name and token permissions',
+    notice_rate_limited: 'API rate limited — please retry later',
+    notice_cancelling: 'Cancelling… (writing will be skipped)',
+    statusbar_cancel_hint: 'Click to cancel the pull',
     setting_title: 'XU Git Pull',
     setting_header_desc: 'One-way pull from a remote repo (private supported) into this vault: full clone, then filtered overwrite — ideal for read-only phones/tablets. Files are added/updated, never deleted.',
     setting_language: 'UI language',
@@ -479,7 +489,7 @@ class GitPullPlugin extends Plugin {
       throw Object.assign(new Error(this.t('notice_ref_not_found', { ref: cfg.ref })), { code: 'verify' });
     }
     const ref = cfg.ref || undefined;
-    const refLabel = cfg.ref || '默认分支';
+    const refLabel = cfg.ref || this.t('ref_default');
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
 
     // ② 清理旧克隆 → 浅克隆（5 分钟超时兜底，心跳显示已用时）
@@ -488,20 +498,30 @@ class GitPullPlugin extends Plugin {
     await this.fsRmrf(fsp, CLONE_DIR);
     const t1 = Date.now();
     const hb = setInterval(() => {
+      if (this._cancelAll) {
+        notice.setMessage(this.t('notice_cancelling'));
+        if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('notice_cancelling'));
+        return;
+      }
       const s = Math.round((Date.now() - t1) / 1000);
       notice.setMessage(this.t('clone_progress', { s }));
       if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('clone_progress', { s }));
     }, 1000);
+    let timeoutId = null;
     try {
       await Promise.race([
         isogit.git.clone({
           fs: fsp, http: this.gitHttp(), url, dir: CLONE_DIR,
           depth: 1, singleBranch: true, ref,
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error(this.t('err_download_timeout'))), CLONE_TIMEOUT_MS)),
+        // 超时兜底：timer 必须清理，否则成功后仍会在 5 分钟时 reject（泄漏 + unhandled rejection）
+        new Promise((_, reject) => {
+          timeoutId = setTimeout(() => reject(new Error(this.t('err_download_timeout'))), CLONE_TIMEOUT_MS);
+        }),
       ]);
     } finally {
       clearInterval(hb);
+      if (timeoutId) clearTimeout(timeoutId);
     }
 
     // ③ 遍历工作区 → 过滤（.obsidian/exclude/子目录）→ 逐文件写 vault（精确进度）
@@ -530,7 +550,6 @@ class GitPullPlugin extends Plugin {
     const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
     notice.hide();
     new Notice(this.t('clone_ok', { n: written, m: all.length - targets.length, s: secs }), 6000);
-    if (this._statusEl) this._statusEl.setText('');
   }
 
 
@@ -546,10 +565,12 @@ class GitPullPlugin extends Plugin {
   }
 
   headers() {
-    const h = {
-      Accept: 'application/vnd.github+json',
-      'X-GitHub-Api-Version': '2022-11-28',
-    };
+    // GitHub 专用头只发给 GitHub；GitCode/Gitee API v5 兼容风格无需这些头
+    const h = {};
+    if ((this.settings.platform || 'github') === 'github') {
+      h.Accept = 'application/vnd.github+json';
+      h['X-GitHub-Api-Version'] = '2022-11-28';
+    }
     const token = this.token();
     if (token) h.Authorization = 'Bearer ' + token;
     return h;
@@ -718,6 +739,12 @@ class GitPullPlugin extends Plugin {
     this._pullBusy = true;
     const n1 = new Notice(this.t('clone_checking'), 0);
     this._cancelAll = false;
+    // 状态栏点击取消入口：标记后克隆自然结束时跳过写盘（克隆在途请求无法硬中断）
+    this._activeAbort = () => { this._cancelAll = true; };
+    if (this._statusEl) {
+      this._statusEl.setAttribute('title', this.t('statusbar_cancel_hint'));
+      this._statusEl.setText('⬇ ' + this.t('clone_checking'));
+    }
     try {
       await this.pullViaClone(cfg, n1);
     } catch (err) {
@@ -734,6 +761,8 @@ class GitPullPlugin extends Plugin {
       new Notice(this.t('clone_fail', { reason: String((err && err.message) || err) }), 6000);
     } finally {
       this._pullBusy = false;
+      this._activeAbort = null;
+      if (this._statusEl) this._statusEl.setText('');
     }
   }
 }
