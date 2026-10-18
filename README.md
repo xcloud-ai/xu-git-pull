@@ -132,10 +132,11 @@ The plugin is one-way: it only adds or updates local files, never uploads or del
 ## 技术说明
 
 - 通过 git smart HTTP 对远程仓库做浅克隆（depth=1）：`info/refs?service=git-upload-pack` + `upload-pack` 两个请求拉全仓，与 REST API 是两套独立配额，实测 GitCode 连发多次零限流
+- 三平台（GitHub / GitCode / Gitee）git 协议认证统一为 Basic `oauth2:<令牌>`，克隆链路完全一致；GitCode 275MB / 6014 文件大仓与 Gitee 真实仓库均已实测通过
 - 克隆由内置的 isomorphic-git（v1.44.2）+ LightningFS 完成，全部打包进 main.js，零外部 require 依赖，桌面/移动端行为一致；克隆数据写入内存级 IndexedDB 文件系统，写盘完成后清理
-- 写盘按过滤规则执行：始终排除 `.git/`、`.trash/`，默认排除 `.obsidian/`（可开关），支持自定义 glob；克隆中新文件先落盘，远程已删除的本地文件保留不动
+- 写盘按过滤规则执行：始终排除 `.git/`、`.trash/`，`.obsidian/` 默认同步（可开关关闭），支持自定义 glob；克隆中新文件先落盘，远程已删除的本地文件保留不动
 - 设置页级联下拉（仓库/分支/子目录）仍走各平台 REST API 并按令牌缓存，仅低频调用
-- 克隆超时 5 分钟（可取消）；401/404 等验证失败均有中文错误提示
+- 克隆超时 5 分钟；拉取中点击状态栏 ⬇ 即可取消（克隆完成后跳过写入）；401/403/404 等验证失败均有中文错误提示
 - 无 Node/Electron 专有 API，`isDesktopOnly: false`，支持 iOS/iPadOS/Android
 
 ## 许可证
