@@ -21,14 +21,10 @@ const GIT_BASES = { github: 'https://github.com', gitcode: 'https://gitcode.com'
 // LightningFS（IndexedDB）内的克隆工作目录与库名
 const CLONE_FS_DB = 'xu-git-pull-fs';
 const CLONE_DIR = '/repo';
-// 整仓克隆的仓库体积上限（MB，repo.size 字段为 KB 换算）：超过自动切增量同步（tree 清单 + 逐文件下载，内存 O(单文件)）。
-// 桌面 500MB：Electron V8 堆 ~4GB，克隆峰值 ≈ 2×pack 实测 275MB 仓 62s 稳定，500MB 留余量；
-// 移动端 100MB：安卓 WebView 堆 256MB（低端）~512MB（主流），100MB 仓峰值 ~200MB 低端机也安全（275MB 实测 OOM 闪退）
-const DESKTOP_CLONE_MAX_MB = 500;
-const MOBILE_CLONE_MAX_MB = 100;
-const cloneMaxMB = () => (Platform.isMobile ? MOBILE_CLONE_MAX_MB : DESKTOP_CLONE_MAX_MB);
-// 增量模式默认限速（每分钟请求数）：GitCode blob API 实测 ~50 个/50s 窗口即限流，留安全余量
-const INCREMENTAL_RPM = 30;
+// 下载模式由用户在设置页手动选择（downloadMode 按平台记忆），插件不做自动决策：
+// - 全量覆盖（clone）：git smart HTTP 浅克隆，2 请求拉全仓，内存峰值 ≈ 2×仓库体积——桌面推荐，手机大仓有 OOM 风险（失败时提示切换）
+// - 限速增量（incremental）：tree 清单对比 + 逐文件下载（ratePerMin 限速）+ 断点续传——手机/大仓推荐
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /** base64 → Uint8Array（git blobs API 返回 base64 内容；atob 在桌面/移动端 WebView 均内置） */
 const b64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
@@ -108,15 +104,21 @@ const I18N = {
     notice_rate_limited: 'API 限流中，请稍后重试',
     notice_cancelling: '取消中…（克隆完成后跳过写入）',
     statusbar_cancel_hint: '点击取消拉取',
-    incremental_hint: '仓库约 {mb}MB，超出本设备整仓克隆能力（内存限制），已切换为增量同步：只下载有变更的文件，支持断点续传',
-    incremental_hint_unknown: '当前平台无法获取仓库体积，移动端已切换为增量同步：只下载有变更的文件，支持断点续传',
-    incremental_hint_remembered: '按上次下载记录使用增量同步：只下载有变更的文件，支持断点续传',
-    incremental_hint_stale: '上次整仓克隆未正常结束（可能内存不足），本次改用增量同步：只下载有变更的文件',
-    setting_reset_modes: '重置下载策略记忆',
-    setting_reset_modes_desc: '清除「克隆/增量」的自动记忆，下次拉取重新按首次逻辑探索',
-    btn_reset: '重置',
-    notice_reset_done: '已清除下载策略记忆',
-    probe_hint: '增量已连续稳定多次，尝试恢复整仓克隆（更快）；失败会自动退回增量',
+    incremental_hint: '限速增量同步：{rpm} 个/分钟，只下载有变更的文件，支持断点续传',
+    mode_full: '全量覆盖',
+    mode_full_desc: '整仓克隆后覆盖写入，速度最快（大库十几秒）；内存占用约仓库体积 2 倍，桌面端推荐',
+    mode_incr: '限速增量',
+    mode_incr_desc: '逐个下载有变更的文件，内存占用极小；限速防平台限流，支持断点续传；手机/大仓推荐',
+    setting_download_mode: '下载模式',
+    setting_download_mode_desc: '全量覆盖为默认；手机端如遇闪退请改用限速增量',
+    setting_rate: '每分钟请求数',
+    btn_help: '帮助',
+    help_title: '下载模式说明',
+    help_clone: '全量覆盖（默认）\n· 整仓克隆，约 2 个网络请求，速度最快\n· 内存占用约为仓库体积的 2 倍\n· 桌面端推荐；手机端大仓库（如上百 MB）可能内存不足闪退\n· 仓库整体覆盖写入（含远程删除清理）',
+    help_incr: '限速增量\n· 只下载有变更的文件，内存占用极小\n· 按每分钟 N 个文件限速，避免触发平台限流\n· 支持断点续传：中断后下次接着传\n· 远程已删除的文件会同步清理',
+    help_rate: '限速建议值\n· GitCode：40/分（实测约 50/分触发限流，留余量）\n· GitHub：60/分\n· Gitee：50/分\n· 0 = 全速（不推荐，大仓易触发 429 限流）',
+    help_cancel: '拉取过程中可点击状态栏 ⬇ 取消；限速增量的进度已保存，下次自动续传',
+    clone_fail_mobile_hint: '手机端克隆失败多为内存不足，建议在设置中切换为「限速增量」模式',
     incr_tree: '增量同步：获取远程文件清单…',
     incr_truncated: '远程文件清单不完整（仓库过大），增量同步中止，请改用桌面端',
     incr_start: '增量同步：{n}/{total} 个文件有变更',
@@ -192,15 +194,21 @@ const I18N = {
     notice_rate_limited: 'API rate limited — please retry later',
     notice_cancelling: 'Cancelling… (writing will be skipped)',
     statusbar_cancel_hint: 'Click to cancel the pull',
-    incremental_hint: 'Repo is ~{mb}MB — beyond full-clone capability on this device (memory limit). Switched to incremental sync: only changed files are downloaded, with resume support.',
-    incremental_hint_unknown: 'Repo size unavailable on this platform — switched to incremental sync (mobile): only changed files are downloaded, with resume support.',
-    incremental_hint_remembered: 'Using remembered strategy: incremental sync — only changed files are downloaded, with resume support.',
-    incremental_hint_stale: 'Last full clone did not finish cleanly (possibly out of memory). Using incremental sync this time: only changed files are downloaded.',
-    setting_reset_modes: 'Reset download strategy memory',
-    setting_reset_modes_desc: 'Clear the auto-remembered clone/incremental strategy; next pull re-explores from scratch',
-    btn_reset: 'Reset',
-    notice_reset_done: 'Download strategy memory cleared',
-    probe_hint: 'Incremental sync has been stable — retrying full clone (faster); falls back automatically on failure.',
+    incremental_hint: 'Incremental sync: {rpm} files/min, only changed files are downloaded, with resume support.',
+    mode_full: 'Full clone',
+    mode_full_desc: 'Clone whole repo then overwrite — fastest (a large repo in seconds); uses ~2x repo size in memory. Recommended on desktop.',
+    mode_incr: 'Throttled incremental',
+    mode_incr_desc: 'Download only changed files one by one — tiny memory footprint; throttled to avoid platform rate limits, with resume support. Recommended on phones / large repos.',
+    setting_download_mode: 'Download mode',
+    setting_download_mode_desc: 'Full clone is the default; if the app crashes on your phone, switch to throttled incremental',
+    setting_rate: 'Requests per minute',
+    btn_help: 'Help',
+    help_title: 'Download modes explained',
+    help_clone: 'Full clone (default)\n- Clone the whole repo in ~2 requests — fastest\n- Uses ~2x repo size in memory\n- Recommended on desktop; large repos (100MB+) may crash mobile apps\n- Overwrites vault files including remote deletions',
+    help_incr: 'Throttled incremental\n- Downloads only changed files, tiny memory footprint\n- Throttled to N files/min to avoid platform rate limits\n- Resume support: interrupted downloads continue next time\n- Remotely deleted files are cleaned up locally',
+    help_rate: 'Suggested throttle values\n- GitCode: 40/min (~50/min triggers rate limit, keep margin)\n- GitHub: 60/min\n- Gitee: 50/min\n- 0 = full speed (not recommended; large repos will hit 429)',
+    help_cancel: 'Tap the ⬇ status-bar item to cancel mid-pull; incremental progress is saved and resumes automatically',
+    clone_fail_mobile_hint: 'Clone failures on phones are usually out-of-memory. Consider switching to "Throttled incremental" in settings.',
     incr_tree: 'Incremental sync: fetching remote file list…',
     incr_truncated: 'Remote file list incomplete (repo too large) — incremental sync aborted. Use desktop instead.',
     incr_start: 'Incremental sync: {n}/{total} files changed',
@@ -306,12 +314,12 @@ const DEFAULT_SETTINGS = {
   exclude: '',
   tokens: { github: '', gitcode: '', gitee: '' },
   profiles: { github: defaultProfile(), gitcode: defaultProfile(), gitee: defaultProfile() },
-  // 下载策略状态机（按 平台:仓库:子目录 记忆实测结果）：mode='clone'|'incremental'，
-  // phase='cloning' 为预写意图（克隆前落盘，进程被杀如移动端 OOM 时残留 → 下次判定降级），
-  // ok 为增量连续成功计数（桌面端达到阈值后试探恢复克隆）。
-  // **按平台分命名空间**：data.json 会随 .obsidian/ 在多端同步，平铺结构会被另一端的结论覆盖
-  // （手机把桌面劫持成增量/反之），命名空间让两端各记各的，物理隔离
-  pullStates: { desktop: {}, mobile: {} },
+  // 下载模式：'clone'（全量覆盖，默认）| 'incremental'（限速增量）。按平台记忆——
+  // data.json 随 .obsidian/ 在多端同步，桌面/手机各自选择互不干扰
+  downloadMode: { desktop: 'clone', mobile: 'clone' },
+  // 限速增量模式的每分钟请求数（按 git 平台预填建议值，用户可改；0 = 全速不推荐）
+  // 建议依据：GitCode 实测约 50 文件/分触发 429 限流，40 留余量
+  ratePerMin: { gitcode: 40, github: 60, gitee: 50 },
 };
 
 // ================================================================
@@ -365,12 +373,6 @@ class GitPullPlugin extends Plugin {
     // tokens / profiles 浅合并（旧配置可能缺 gitcode 键），profile 逐键补默认
     this.settings.tokens = Object.assign({}, DEFAULT_SETTINGS.tokens, this.settings.tokens || {});
     this.settings.profiles = Object.assign({}, DEFAULT_SETTINGS.profiles, this.settings.profiles || {});
-    // pullStates 结构迁移：1.6.0 平铺（键含平台前缀）→ 1.7.0 按平台命名空间（data.json 多端同步防互踩）；
-    // 平铺结论无法可靠拆分 by 平台，直接重置重新探索（一次性代价）
-    const ps = this.settings.pullStates;
-    if (!ps || typeof ps !== 'object' || !ps.desktop || !ps.mobile) {
-      this.settings.pullStates = { desktop: {}, mobile: {} };
-    }
     for (const pf of Object.keys(this.settings.profiles)) {
       this.settings.profiles[pf] = Object.assign(defaultProfile(), this.settings.profiles[pf] || {});
     }
@@ -683,7 +685,8 @@ class GitPullPlugin extends Plugin {
     if (this._statusEl) this._statusEl.setText('⬇ 0/' + changed.length);
 
     // ④ 限速逐文件下载（git blobs API 三平台同构；每 20 个文件落盘 manifest 断点）
-    const gap = Math.ceil(60000 / (this._incrRpm || INCREMENTAL_RPM));
+    const rpm = (this.settings.ratePerMin && this.settings.ratePerMin[this.settings.platform]) || 40;
+    const gap = rpm > 0 ? Math.ceil(60000 / rpm) : 0; // 0 = 全速（帮助文档已提示不推荐）
     const blobBase = this.apiBase() + '/repos/' + owner + '/' + repo + '/git/blobs/';
     const BIG_FILE = 20 * 1024 * 1024; // base64 解码峰值 ≈ 3×文件大小，安卓 WebView 单文件 >20MB 有 OOM 风险
     let lastTs = 0;
@@ -943,50 +946,6 @@ class GitPullPlugin extends Plugin {
     return this.cacheSet(key, folders);
   }
 
-  /** 下载策略状态机的键：仓库[:子目录]（平台维度由命名空间隔离，不再入键） */
-  pullStateKey(cfg) {
-    const rp = (this.settings.remotePath || '').replace(/^\/+|\/+$/g, '');
-    return [cfg.owner, cfg.repo, rp].filter(Boolean).join(':');
-  }
-
-  /** 当前平台的策略状态命名空间（data.json 多端同步，命名空间物理隔离双端结论） */
-  pullStateNs() {
-    const plat = Platform.isMobile ? 'mobile' : 'desktop';
-    if (!this.settings.pullStates || typeof this.settings.pullStates !== 'object') this.settings.pullStates = { desktop: {}, mobile: {} };
-    if (!this.settings.pullStates[plat] || typeof this.settings.pullStates[plat] !== 'object') this.settings.pullStates[plat] = {};
-    return this.settings.pullStates[plat];
-  }
-
-  /** 合并写入一条策略状态并持久化（patch 不含的字段保留原值） */
-  async savePullState(key, patch) {
-    const ns = this.pullStateNs();
-    const next = Object.assign({}, ns[key] || {}, patch);
-    ns[key] = next;
-    await this.saveSettings();
-    return next;
-  }
-
-  /**
-   * 带状态记忆的克隆执行：
-   * - 克隆前预写 phase='cloning'（WAL 意图）——进程被杀（移动端 OOM）时残留即为失败记录，下次启动降级增量
-   * - 成功 → mode='clone'；用户取消/配置错误 → 只清 phase 不改结论；本体失败 → 降级 mode='incremental' 并清零回升计数
-   */
-  async cloneWithState(stateKey, cfg, notice) {
-    await this.savePullState(stateKey, { phase: 'cloning' });
-    try {
-      await this.pullViaClone(cfg, notice);
-      await this.savePullState(stateKey, { mode: 'clone', phase: 'idle', ok: 0 });
-    } catch (err) {
-      if ((err && err.code === 'aborted') || this._cancelAll || (err && err.code === 'verify')) {
-        // 取消 = 用户主观中止；verify = 仓库/token 配置问题——都不是"克隆能力不足"，保留原结论
-        await this.savePullState(stateKey, { phase: 'idle' });
-      } else {
-        await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', ok: 0 });
-      }
-      throw err;
-    }
-  }
-
   async pull() {
     const cfg = this.resolveConfig();
     if (cfg.error) {
@@ -1012,74 +971,18 @@ class GitPullPlugin extends Plugin {
       this._statusEl.setText('⬇ ' + this.t('clone_checking'));
     }
     try {
-      // ── 下载策略状态机：按 实测结果 决策（WAL 预写 + 崩溃残留检测），size 预检仅第一次探索时使用 ──
-      const stateKey = this.pullStateKey(cfg);
-      let st = this.pullStateNs()[stateKey];
-      let stale = false;
-
-      // 崩溃残留：phase='cloning' = 上次克隆未正常结束（含移动端 OOM 被杀）→ 降级增量
-      if (st && st.phase === 'cloning') {
-        st = await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', ok: 0 });
-        stale = true;
-      }
-
-      const mode = st ? st.mode : null;
-
-      if (mode === 'incremental') {
-        // 桌面端回升试探：增量连续稳定 PROBE_AFTER 次后试一次克隆（失败自动退回，ok 清零）；
-        // 手机端不回升——试探失败的代价是 OOM 闪退，保守只增不减
-        const PROBE_AFTER = 5;
-        if (!Platform.isMobile && st.ok >= PROBE_AFTER) {
-          new Notice(this.t('probe_hint'), 5000);
-          await this.cloneWithState(stateKey, cfg, n1);
-          return;
-        }
-        const msg = stale ? this.t('incremental_hint_stale') : this.t('incremental_hint_remembered');
+      // ── 下载模式：用户手动选择，按平台记忆（桌面/手机各自设置互不干扰）──
+      const platKey = Platform.isMobile ? 'mobile' : 'desktop';
+      const dm = this.settings.downloadMode && this.settings.downloadMode[platKey];
+      if (dm === 'incremental') {
+        const rpm = (this.settings.ratePerMin && this.settings.ratePerMin[this.settings.platform]) || 40;
+        const msg = this.t('incremental_hint', { rpm });
         n1.setMessage(msg);
         new Notice(msg, 4000);
         await this.pullIncremental(cfg, n1);
-        // 增量成功（未抛错）→ 连续成功计数 +1，供桌面端回升试探
-        await this.savePullState(stateKey, { ok: ((st && st.ok) || 0) + 1 });
         return;
       }
-
-      if (mode === 'clone') {
-        await this.cloneWithState(stateKey, cfg, n1);
-        return;
-      }
-
-      // ── 第一次探索：size 预检只在这里查（此后按记忆直达）──
-      // repo.size 单位 KB。GitCode 实测无 size 字段（None→0）→ size 不可用时移动端保守走增量（不拿用户体验换探索），桌面克隆探索
-      let sizeMB = 0;
-      let sizeKnown = false;
-      try {
-        const info = await this.apiGetJson(this.apiBase() + '/repos/' + cfg.owner + '/' + cfg.repo);
-        const kb = Number(info && info.size) || 0;
-        sizeMB = Math.round(kb / 1024);
-        sizeKnown = kb > 0;
-      } catch (e) {
-        // 认证/仓库问题直接抛（增量/克隆都过不去）
-        if (e.code === 'unauthorized' || e.code === 'not_found' || e.code === 'rate_limited') throw e;
-      }
-
-      if (sizeKnown && sizeMB > cloneMaxMB()) {
-        await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', ok: 0 });
-        const msg = this.t('incremental_hint', { mb: sizeMB });
-        n1.setMessage(msg);
-        new Notice(msg, 6000);
-        await this.pullIncremental(cfg, n1);
-        return;
-      }
-      if (Platform.isMobile && !sizeKnown) {
-        await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', ok: 0 });
-        const msg = this.t('incremental_hint_unknown');
-        n1.setMessage(msg);
-        new Notice(msg, 6000);
-        await this.pullIncremental(cfg, n1);
-        return;
-      }
-
-      await this.cloneWithState(stateKey, cfg, n1);
+      await this.pullViaClone(cfg, n1);
     } catch (err) {
       n1.hide();
       if (this._cancelAll || (err && err.code === 'aborted')) {
@@ -1091,6 +994,8 @@ class GitPullPlugin extends Plugin {
         return;
       }
       console.error('[' + PLUGIN_ID + '] pull failed:', err);
+      // 手机端克隆失败大概率是 WebView 内存不足——引导切换限速增量模式
+      if (Platform.isMobile) new Notice(this.t('clone_fail_mobile_hint'), 8000);
       new Notice(this.t('clone_fail', { reason: String((err && err.message) || err) }), 6000);
     } finally {
       this._pullBusy = false;
@@ -1103,6 +1008,28 @@ class GitPullPlugin extends Plugin {
 // ================================================================
 //  设置页（1.13 声明式 Path A）
 // ================================================================
+/** 下载模式帮助弹窗（设置页「?」点击打开）：两种模式对比 + 限速建议依据 + 取消说明 */
+class DownloadModeHelpModal extends Modal {
+  constructor(plugin) {
+    super(plugin.app);
+    this.plugin = plugin;
+  }
+  onOpen() {
+    const p = this.plugin;
+    const { contentEl } = this;
+    contentEl.createEl('h3', { text: p.t('help_title') });
+    const sec = (title, text) => {
+      contentEl.createEl('h4', { text: title });
+      contentEl.createEl('p', { text, attr: { style: 'white-space: pre-line; margin: 4px 0 12px; font-size: 13px;' } });
+    };
+    sec(p.t('mode_full'), p.t('help_clone'));
+    sec(p.t('mode_incr'), p.t('help_incr'));
+    sec(p.t('setting_rate'), p.t('help_rate'));
+    contentEl.createEl('p', { text: p.t('help_cancel'), attr: { style: 'color: var(--text-muted); font-size: 12px;' } });
+  }
+  onClose() { this.contentEl.empty(); }
+}
+
 class GitPullSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -1200,17 +1127,58 @@ class GitPullSettingTab extends PluginSettingTab {
       },
       // 立即拉取（action 行）
       { name: p.t('action_pull'), desc: p.t('action_pull_desc'), action: () => { void p.pull(); } },
-      // 重置下载策略记忆（清空 pullStates，下次重新探索）
+      // 下载模式：全量覆盖（默认）/ 限速增量——按平台记忆，双端各自设置互不干扰
       {
-        name: p.t('setting_reset_modes'),
-        desc: p.t('setting_reset_modes_desc'),
+        name: p.t('setting_download_mode'),
+        desc: p.t('setting_download_mode_desc'),
         render: (setting) => {
+          const platKey = Platform.isMobile ? 'mobile' : 'desktop';
+          const cur = (p.settings.downloadMode && p.settings.downloadMode[platKey]) || 'clone';
           setting.addButton((b) => {
-            b.setButtonText(p.t('btn_reset'));
-            b.onClick(() => {
-              p.settings.pullStates = { desktop: {}, mobile: {} };
+            b.setButtonText(p.t('mode_full') + (cur === 'clone' ? ' ✓' : ''));
+            b.setCta(cur === 'clone');
+            b.onClick(async () => {
+              p.settings.downloadMode = p.settings.downloadMode || {};
+              p.settings.downloadMode[platKey] = 'clone';
+              await p.saveSettings();
+              this.update();
+            });
+          });
+          setting.addButton((b) => {
+            b.setButtonText(p.t('mode_incr') + (cur === 'incremental' ? ' ✓' : ''));
+            b.setCta(cur === 'incremental');
+            b.onClick(async () => {
+              p.settings.downloadMode = p.settings.downloadMode || {};
+              p.settings.downloadMode[platKey] = 'incremental';
+              await p.saveSettings();
+              this.update();
+            });
+          });
+          setting.addButton((b) => {
+            b.setButtonText('?');
+            b.setTooltip(p.t('btn_help'));
+            b.onClick(() => new DownloadModeHelpModal(p).open());
+          });
+        },
+      },
+      // 限速值（选限速增量时才有意义；预填当前平台建议值，可改，0 = 全速）
+      {
+        name: p.t('setting_rate') + '（' + this.platformBareName(p) + '）',
+        desc: (p.t('mode_incr_desc').split('；')[1] || '') + ' · GitCode 40 / GitHub 60 / Gitee 50，0 = 全速',
+        render: (setting) => {
+          const plat = p.settings.platform || 'github';
+          setting.addText((text) => {
+            text.inputEl.type = 'number';
+            text.inputEl.min = '0';
+            text.inputEl.max = '600';
+            const rp = p.settings.ratePerMin || {};
+            text.setValue(String(rp[plat] != null ? rp[plat] : ''));
+            text.setPlaceholder(String(DEFAULT_SETTINGS.ratePerMin[plat] || 40));
+            text.onChange((v) => {
+              p.settings.ratePerMin = p.settings.ratePerMin || {};
+              const n = Math.max(0, Math.min(600, parseInt(v, 10) || 0));
+              p.settings.ratePerMin[plat] = n;
               void p.saveSettings();
-              new Notice(p.t('notice_reset_done'), 3000);
             });
           });
         },
