@@ -21,6 +21,10 @@ const GIT_BASES = { github: 'https://github.com', gitcode: 'https://gitcode.com'
 // LightningFS（IndexedDB）内的克隆工作目录与库名
 const CLONE_FS_DB = 'xu-git-pull-fs';
 const CLONE_DIR = '/repo';
+// 内置排除（不可配置、不进用户规则编辑框）：community-plugins.json 是插件启用清单——
+// 覆盖后本插件在手机端会变回未启用（App 重启后"消失"），workspace.json 会用桌面布局覆盖手机工作区。
+// 二者只属于各设备本地状态，同步它们有弊无利（1.8.3）
+const BUILTIN_EXCLUDES = ['community-plugins.json', 'workspace.json'];
 // 下载模式由用户在设置页手动选择（downloadMode 按平台记忆），插件不做自动决策：
 // - 全量覆盖（clone）：git smart HTTP 浅克隆，2 请求拉全仓，内存峰值 ≈ 2×仓库体积——桌面推荐，手机大仓有 OOM 风险（失败时提示切换）
 // - 限速增量（incremental）：tree 清单对比 + 逐文件下载（ratePerMin 限速）+ 断点续传——手机/大仓推荐
@@ -156,7 +160,7 @@ const I18N = {
     setting_include_obsidian: '下载 .obsidian 配置目录',
     setting_include_obsidian_desc: '默认开启（同步 .obsidian/ 配置目录，插件与外观配置跟随仓库）。不希望覆盖本机配置时手动关闭。',
     setting_exclude: '额外排除规则（每行一条 glob）',
-    setting_exclude_desc: '始终排除 .git/ 与 .trash/；此处可追加，** 匹配任意层级目录，* 匹配单层名称',
+    setting_exclude_desc: '已内置排除 .git/、.trash/、community-plugins.json、workspace.json（设备本地状态，同步有弊无利）；此处可追加，** 匹配任意层级目录，* 匹配单层名称',
     action_pull: '立即拉取',
     action_pull_desc: '验证远程仓库后整仓克隆并覆盖更新',
     setting_token: '{name} Token',
@@ -246,7 +250,7 @@ const I18N = {
     setting_include_obsidian: 'Download the .obsidian config folder',
     setting_include_obsidian_desc: 'On by default (syncs .obsidian/ so plugins and appearance follow the repo). Turn off to keep local config.',
     setting_exclude: 'Extra exclude patterns (one glob per line)',
-    setting_exclude_desc: '.git/ and .trash/ are always excluded. Add more here. ** matches any depth, * a single segment.',
+    setting_exclude_desc: 'Built-in: .git/, .trash/, community-plugins.json, workspace.json (device-local state — never sync these). Add more here. ** matches any depth, * a single segment.',
     action_pull: 'Pull now',
     action_pull_desc: 'Verify the remote repo, then clone and overwrite',
     setting_token: '{name} token',
@@ -815,7 +819,7 @@ class GitPullPlugin extends Plugin {
     if (!m) return { error: this.t('notice_repo_invalid') };
 
     // 始终排除 .git/.trash；.obsidian 由开关决定；再拼用户自定义规则
-    const patterns = ['.git/**', '.trash/**'];
+    const patterns = ['.git/**', '.trash/**'].concat(BUILTIN_EXCLUDES);
     if (!this.settings.includeObsidian) patterns.push('.obsidian/**');
     const matchers = patterns
       .concat(String(this.settings.exclude || '').split('\n').map((s) => s.trim()))
