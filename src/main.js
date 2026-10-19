@@ -1017,9 +1017,10 @@ class DownloadModeHelpModal extends Modal {
   onOpen() {
     const p = this.plugin;
     const { contentEl } = this;
-    contentEl.createEl('h3', { text: p.t('help_title') });
+    // 标题用 div+class 而非 createEl('hN')——官方审核禁止 Modal/设置页手工拼 HTML 标题
+    contentEl.createEl('div', { cls: 'xgp-help-title', text: p.t('help_title') });
     const sec = (title, text) => {
-      contentEl.createEl('h4', { text: title });
+      contentEl.createEl('div', { cls: 'xgp-help-h', text: title });
       contentEl.createEl('p', { text, attr: { style: 'white-space: pre-line; margin: 4px 0 12px; font-size: 13px;' } });
     };
     sec(p.t('mode_full'), p.t('help_clone'));

@@ -110,3 +110,7 @@
   padding: 8px 0 0;
   justify-content: flex-end;
 }
+
+/* 下载模式帮助弹窗标题（替代 createEl('hN')——审核合规） */
+.xgp-help-title { font-size: 18px; font-weight: 600; margin: 0 0 16px; }
+.xgp-help-h { font-size: 14px; font-weight: 600; margin: 10px 0 2px; }
