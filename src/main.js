@@ -116,15 +116,16 @@ const I18N = {
     setting_reset_modes_desc: '清除「克隆/增量」的自动记忆，下次拉取重新按首次逻辑探索',
     btn_reset: '重置',
     notice_reset_done: '已清除下载策略记忆',
+    probe_hint: '增量已连续稳定多次，尝试恢复整仓克隆（更快）；失败会自动退回增量',
     incr_tree: '增量同步：获取远程文件清单…',
     incr_truncated: '远程文件清单不完整（仓库过大），增量同步中止，请改用桌面端',
     incr_start: '增量同步：{n}/{total} 个文件有变更',
     incr_none: '增量同步：无变更（{total} 个文件均为最新）',
     incr_wait: '触发平台限流，等待 {s}s 后自动继续…',
-    incr_done: '增量同步完成：更新 {n} 个文件（{m} 个无变更跳过），耗时 {s}s',
+    incr_done: '增量同步完成：更新 {n} 个、清理远程已删除 {d} 个（{m} 个无变更跳过），耗时 {s}s',
     incr_skipped: '已跳过 {n} 个超大文件（>20MB，移动端内存限制）：{list}',
     setting_title: 'XU Git Pull（远程资料拉取）',
-    setting_header_desc: '从远程仓库（支持私有库）单向拉取文件到本 vault：整仓克隆后按过滤规则覆盖写入，适合手机/平板只看资料的场景。只增改，不删除本地文件。',
+    setting_header_desc: '从远程仓库（支持私有库）单向拉取文件到本 vault：按仓库体积自动选择整仓克隆覆盖或增量同步（含远程删除清理），适合手机/平板只看资料的场景。',
     setting_language: '界面语言',
     lang_zh: '中文',
     lang_en: 'English',
@@ -199,15 +200,16 @@ const I18N = {
     setting_reset_modes_desc: 'Clear the auto-remembered clone/incremental strategy; next pull re-explores from scratch',
     btn_reset: 'Reset',
     notice_reset_done: 'Download strategy memory cleared',
+    probe_hint: 'Incremental sync has been stable — retrying full clone (faster); falls back automatically on failure.',
     incr_tree: 'Incremental sync: fetching remote file list…',
     incr_truncated: 'Remote file list incomplete (repo too large) — incremental sync aborted. Use desktop instead.',
     incr_start: 'Incremental sync: {n}/{total} files changed',
     incr_none: 'Incremental sync: nothing changed ({total} files up to date)',
     incr_wait: 'Rate limited — retrying in {s}s…',
-    incr_done: 'Incremental sync done: {n} updated ({m} unchanged), took {s}s',
+    incr_done: 'Incremental sync done: {n} updated, {d} remote-deleted removed ({m} unchanged), took {s}s',
     incr_skipped: 'Skipped {n} oversized file(s) (>20MB, mobile memory limit): {list}',
     setting_title: 'XU Git Pull',
-    setting_header_desc: 'One-way pull from a remote repo (private supported) into this vault: full clone, then filtered overwrite — ideal for read-only phones/tablets. Files are added/updated, never deleted.',
+    setting_header_desc: 'One-way pull from a remote repo (private supported) into this vault: full clone or incremental sync chosen automatically by repo size (with remote-deletion cleanup) — ideal for read-only phones/tablets.',
     setting_language: 'UI language',
     lang_zh: '中文',
     lang_en: 'English',
@@ -306,8 +308,10 @@ const DEFAULT_SETTINGS = {
   profiles: { github: defaultProfile(), gitcode: defaultProfile(), gitee: defaultProfile() },
   // 下载策略状态机（按 平台:仓库:子目录 记忆实测结果）：mode='clone'|'incremental'，
   // phase='cloning' 为预写意图（克隆前落盘，进程被杀如移动端 OOM 时残留 → 下次判定降级），
-  // by 记录产生该结论的平台（clone 结论不跨平台复用——桌面能扛不代表手机能扛）
-  pullStates: {},
+  // ok 为增量连续成功计数（桌面端达到阈值后试探恢复克隆）。
+  // **按平台分命名空间**：data.json 会随 .obsidian/ 在多端同步，平铺结构会被另一端的结论覆盖
+  // （手机把桌面劫持成增量/反之），命名空间让两端各记各的，物理隔离
+  pullStates: { desktop: {}, mobile: {} },
 };
 
 // ================================================================
@@ -361,6 +365,12 @@ class GitPullPlugin extends Plugin {
     // tokens / profiles 浅合并（旧配置可能缺 gitcode 键），profile 逐键补默认
     this.settings.tokens = Object.assign({}, DEFAULT_SETTINGS.tokens, this.settings.tokens || {});
     this.settings.profiles = Object.assign({}, DEFAULT_SETTINGS.profiles, this.settings.profiles || {});
+    // pullStates 结构迁移：1.6.0 平铺（键含平台前缀）→ 1.7.0 按平台命名空间（data.json 多端同步防互踩）；
+    // 平铺结论无法可靠拆分 by 平台，直接重置重新探索（一次性代价）
+    const ps = this.settings.pullStates;
+    if (!ps || typeof ps !== 'object' || !ps.desktop || !ps.mobile) {
+      this.settings.pullStates = { desktop: {}, mobile: {} };
+    }
     for (const pf of Object.keys(this.settings.profiles)) {
       this.settings.profiles[pf] = Object.assign(defaultProfile(), this.settings.profiles[pf] || {});
     }
@@ -631,19 +641,42 @@ class GitPullPlugin extends Plugin {
       targets.push({ key, path: p, sha: it.sha, size: Number(it.size) || 0 });
     }
 
-    // ③ 本地 manifest（上次成功下载的 path→sha 快照；换分支则重置全量重下）
-    const mKey = normalizePath('.xu-git-pull/' + (this.settings.platform || 'github') + '-' + owner + '-' + repo + '.json');
+    // ③ 本地 manifest（上次成功下载的 path→sha 快照；换分支/换子目录则重置全量重下）
+    // mKey 含子目录 slug：切换 remotePath 后新旧范围互不干扰，避免误删旧范围文件
+    const rpSlug = ((this.settings.remotePath || '').replace(/^\/+|\/+$/g, '').replace(/[^a-zA-Z0-9._-]+/g, '-') || 'root');
+    const mKey = normalizePath('.xu-git-pull/' + (this.settings.platform || 'github') + '-' + owner + '-' + repo + '-' + rpSlug + '.json');
     let manifest = { ref: refName, files: {} };
     try {
       const prev = JSON.parse(await this.app.vault.adapter.read(mKey));
       if (prev && prev.ref === refName && prev.files && typeof prev.files === 'object') manifest = prev;
     } catch (e) { /* 无清单 → 全量 */ }
+
+    // ③′ 远程删除同步：manifest 记录里有、本次远程清单没有的 → 本地删除。
+    // 必须在 changed==0 提前返回之前：远程「只删文件」时 changed 为空，漏掉这步会永久漂移
+    const have = new Set(targets.map((t) => t.path));
+    const goneKeys = Object.keys(manifest.files).filter((p) => !have.has(p));
+    let deleted = 0;
+    if (goneKeys.length > 0) {
+      const lp = (this.settings.localPath || '').replace(/\/+$/, '');
+      for (const gp of goneKeys) {
+        const key = prefix ? (gp.startsWith(prefix) ? gp.slice(prefix.length) : null) : gp;
+        delete manifest.files[gp];
+        if (key === null || key === '') continue; // 跨范围残键只清记录，本地映射不明不删
+        try {
+          const fp = normalizePath(lp + '/' + key);
+          if (await this.app.vault.adapter.exists(fp)) { await this.app.vault.adapter.remove(fp); deleted++; }
+        } catch (e) { /* 单文件删除失败不阻塞同步 */ }
+      }
+      if (deleted > 0) await this.saveManifestSafe(mKey, manifest);
+    }
+
     const changed = targets.filter((t) => manifest.files[t.path] !== t.sha);
     const t0 = Date.now();
 
     if (changed.length === 0) {
       notice.hide();
-      new Notice(this.t('incr_none', { total: targets.length }), 8000);
+      if (deleted > 0) new Notice(this.t('incr_done', { n: 0, m: 0, d: deleted, s: 0 }), 8000);
+      else new Notice(this.t('incr_none', { total: targets.length }), 8000);
       return;
     }
     notice.setMessage(this.t('incr_start', { n: changed.length, total: targets.length }));
@@ -723,7 +756,7 @@ class GitPullPlugin extends Plugin {
     await this.saveManifestSafe(mKey, manifest);
     const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
     notice.hide();
-    new Notice(this.t('incr_done', { n: done, m: targets.length - changed.length, s: secs }), 8000);
+    new Notice(this.t('incr_done', { n: done, m: targets.length - changed.length, d: deleted, s: secs }), 8000);
     if (skipped.length > 0) {
       const list = skipped.slice(0, 3).join('、') + (skipped.length > 3 ? ' 等' : '');
       new Notice(this.t('incr_skipped', { n: skipped.length, list }), 8000);
@@ -910,17 +943,25 @@ class GitPullPlugin extends Plugin {
     return this.cacheSet(key, folders);
   }
 
-  /** 下载策略状态机的键：平台:仓库[:子目录]，各链路独立记忆 */
+  /** 下载策略状态机的键：仓库[:子目录]（平台维度由命名空间隔离，不再入键） */
   pullStateKey(cfg) {
     const rp = (this.settings.remotePath || '').replace(/^\/+|\/+$/g, '');
-    return [this.settings.platform, cfg.owner, cfg.repo, rp].filter(Boolean).join(':');
+    return [cfg.owner, cfg.repo, rp].filter(Boolean).join(':');
+  }
+
+  /** 当前平台的策略状态命名空间（data.json 多端同步，命名空间物理隔离双端结论） */
+  pullStateNs() {
+    const plat = Platform.isMobile ? 'mobile' : 'desktop';
+    if (!this.settings.pullStates || typeof this.settings.pullStates !== 'object') this.settings.pullStates = { desktop: {}, mobile: {} };
+    if (!this.settings.pullStates[plat] || typeof this.settings.pullStates[plat] !== 'object') this.settings.pullStates[plat] = {};
+    return this.settings.pullStates[plat];
   }
 
   /** 合并写入一条策略状态并持久化（patch 不含的字段保留原值） */
   async savePullState(key, patch) {
-    const cur = this.settings.pullStates[key] || {};
-    const next = Object.assign({}, cur, patch);
-    this.settings.pullStates[key] = next;
+    const ns = this.pullStateNs();
+    const next = Object.assign({}, ns[key] || {}, patch);
+    ns[key] = next;
     await this.saveSettings();
     return next;
   }
@@ -928,19 +969,19 @@ class GitPullPlugin extends Plugin {
   /**
    * 带状态记忆的克隆执行：
    * - 克隆前预写 phase='cloning'（WAL 意图）——进程被杀（移动端 OOM）时残留即为失败记录，下次启动降级增量
-   * - 成功 → mode='clone'（记 by 平台）；用户取消/配置错误 → 只清 phase 不改结论；本体失败 → 降级 mode='incremental'
+   * - 成功 → mode='clone'；用户取消/配置错误 → 只清 phase 不改结论；本体失败 → 降级 mode='incremental' 并清零回升计数
    */
-  async cloneWithState(stateKey, platTag, cfg, notice) {
-    await this.savePullState(stateKey, { phase: 'cloning', by: platTag });
+  async cloneWithState(stateKey, cfg, notice) {
+    await this.savePullState(stateKey, { phase: 'cloning' });
     try {
       await this.pullViaClone(cfg, notice);
-      await this.savePullState(stateKey, { mode: 'clone', phase: 'idle', by: platTag });
+      await this.savePullState(stateKey, { mode: 'clone', phase: 'idle', ok: 0 });
     } catch (err) {
       if ((err && err.code === 'aborted') || this._cancelAll || (err && err.code === 'verify')) {
         // 取消 = 用户主观中止；verify = 仓库/token 配置问题——都不是"克隆能力不足"，保留原结论
         await this.savePullState(stateKey, { phase: 'idle' });
       } else {
-        await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', by: platTag });
+        await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', ok: 0 });
       }
       throw err;
     }
@@ -973,30 +1014,37 @@ class GitPullPlugin extends Plugin {
     try {
       // ── 下载策略状态机：按 实测结果 决策（WAL 预写 + 崩溃残留检测），size 预检仅第一次探索时使用 ──
       const stateKey = this.pullStateKey(cfg);
-      const platTag = Platform.isMobile ? 'mobile' : 'desktop';
-      let st = this.settings.pullStates[stateKey];
+      let st = this.pullStateNs()[stateKey];
       let stale = false;
 
       // 崩溃残留：phase='cloning' = 上次克隆未正常结束（含移动端 OOM 被杀）→ 降级增量
       if (st && st.phase === 'cloning') {
-        st = await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', by: platTag });
+        st = await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', ok: 0 });
         stale = true;
       }
 
-      let mode = st ? st.mode : null;
-      // 平台隔离：clone 结论不跨平台复用（桌面能扛不代表手机能扛），视为无记录重新探索
-      if (mode === 'clone' && st.by && st.by !== platTag) mode = null;
+      const mode = st ? st.mode : null;
 
       if (mode === 'incremental') {
+        // 桌面端回升试探：增量连续稳定 PROBE_AFTER 次后试一次克隆（失败自动退回，ok 清零）；
+        // 手机端不回升——试探失败的代价是 OOM 闪退，保守只增不减
+        const PROBE_AFTER = 5;
+        if (!Platform.isMobile && st.ok >= PROBE_AFTER) {
+          new Notice(this.t('probe_hint'), 5000);
+          await this.cloneWithState(stateKey, cfg, n1);
+          return;
+        }
         const msg = stale ? this.t('incremental_hint_stale') : this.t('incremental_hint_remembered');
         n1.setMessage(msg);
         new Notice(msg, 4000);
         await this.pullIncremental(cfg, n1);
+        // 增量成功（未抛错）→ 连续成功计数 +1，供桌面端回升试探
+        await this.savePullState(stateKey, { ok: ((st && st.ok) || 0) + 1 });
         return;
       }
 
       if (mode === 'clone') {
-        await this.cloneWithState(stateKey, platTag, cfg, n1);
+        await this.cloneWithState(stateKey, cfg, n1);
         return;
       }
 
@@ -1015,7 +1063,7 @@ class GitPullPlugin extends Plugin {
       }
 
       if (sizeKnown && sizeMB > cloneMaxMB()) {
-        await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', by: platTag });
+        await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', ok: 0 });
         const msg = this.t('incremental_hint', { mb: sizeMB });
         n1.setMessage(msg);
         new Notice(msg, 6000);
@@ -1023,7 +1071,7 @@ class GitPullPlugin extends Plugin {
         return;
       }
       if (Platform.isMobile && !sizeKnown) {
-        await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', by: platTag });
+        await this.savePullState(stateKey, { mode: 'incremental', phase: 'idle', ok: 0 });
         const msg = this.t('incremental_hint_unknown');
         n1.setMessage(msg);
         new Notice(msg, 6000);
@@ -1031,7 +1079,7 @@ class GitPullPlugin extends Plugin {
         return;
       }
 
-      await this.cloneWithState(stateKey, platTag, cfg, n1);
+      await this.cloneWithState(stateKey, cfg, n1);
     } catch (err) {
       n1.hide();
       if (this._cancelAll || (err && err.code === 'aborted')) {
@@ -1160,7 +1208,7 @@ class GitPullSettingTab extends PluginSettingTab {
           setting.addButton((b) => {
             b.setButtonText(p.t('btn_reset'));
             b.onClick(() => {
-              p.settings.pullStates = {};
+              p.settings.pullStates = { desktop: {}, mobile: {} };
               void p.saveSettings();
               new Notice(p.t('notice_reset_done'), 3000);
             });
