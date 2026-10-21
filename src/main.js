@@ -97,7 +97,7 @@ const I18N = {
     clone_verified: '验证通过：{repo}（{ref}），开始整仓克隆…',
     clone_progress: '克隆中… {s}s',
     write_progress: '写入 {i}/{n}',
-    clone_ok: '拉取完成：写入 {n} 个文件（过滤掉 {m} 个）· 用时 {s}s',
+    clone_ok: '拉取完成：写入 {n} 个文件（过滤 {m} 个）· 验证 {v}s + 下载 {c}s + 写盘 {w}s',
     clone_fail: '克隆失败：{reason}',
     notice_ref_not_found: '分支不存在：{ref}',
     notice_aborted_simple: '已取消',
@@ -187,7 +187,7 @@ const I18N = {
     clone_verified: 'Verified: {repo} ({ref}). Cloning…',
     clone_progress: 'Cloning… {s}s',
     write_progress: 'Writing {i}/{n}',
-    clone_ok: 'Done: {n} file(s) written ({m} filtered) in {s}s',
+    clone_ok: 'Done: {n} file(s) ({m} filtered) — verify {v}s + download {c}s + write {w}s',
     clone_fail: 'Clone failed: {reason}',
     notice_ref_not_found: 'Branch not found: {ref}',
     notice_aborted_simple: 'Cancelled',
@@ -573,42 +573,56 @@ class GitPullPlugin extends Plugin {
     }
 
     // ③ 遍历提交树（noCheckout 模式无工作区）→ 过滤 → 逐 blob 读对象写 vault（精确进度）
+    //    写盘段包 try/finally：无论成功/失败/取消，结束即删 /repo/.git——
+    //    git 对象（264MB 级）不再常驻 IndexedDB，下次克隆前 fsRmrf 瞬时完成
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
-    const headOid = await isogit.git.resolveRef({ fs: fsp, dir: CLONE_DIR, ref: 'HEAD' });
-    const commit = await isogit.git.readCommit({ fs: fsp, dir: CLONE_DIR, oid: headOid });
-    const all = [];
-    const walkTree = async (oid, prefix) => {
-      const { tree } = await isogit.git.readTree({ fs: fsp, dir: CLONE_DIR, oid });
-      for (const it of tree) {
-        const full = prefix ? prefix + '/' + it.path : it.path;
-        if (it.type === 'tree') await walkTree(it.oid, full);
-        else if (it.type === 'blob') all.push({ path: full, oid: it.oid });
-        // symlink(120000)/gitlink(160000 子模块) 不落盘
+    try {
+      const t2 = Date.now();
+      const headOid = await isogit.git.resolveRef({ fs: fsp, dir: CLONE_DIR, ref: 'HEAD' });
+      const commit = await isogit.git.readCommit({ fs: fsp, dir: CLONE_DIR, oid: headOid });
+      const all = [];
+      const walkTree = async (oid, prefix) => {
+        const { tree } = await isogit.git.readTree({ fs: fsp, dir: CLONE_DIR, oid });
+        for (const it of tree) {
+          const full = prefix ? prefix + '/' + it.path : it.path;
+          if (it.type === 'tree') await walkTree(it.oid, full);
+          else if (it.type === 'blob') all.push({ path: full, oid: it.oid });
+          // symlink(120000)/gitlink(160000 子模块) 不落盘
+        }
+      };
+      await walkTree(commit.commit.tree, '');
+      const prefix = cfg.remotePath ? cfg.remotePath.replace(/\/+$/, '') + '/' : '';
+      const targets = all.filter((it) => {
+        if (it.path.split('/').includes('..')) return false; // 防越界
+        const key = prefix ? (it.path.startsWith(prefix) ? it.path.slice(prefix.length) : null) : it.path;
+        if (key === null || key === '') return false;
+        return !matchAny(key, cfg.matchers);
+      });
+      let written = 0;
+      for (const it of targets) {
+        if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
+        const key = prefix ? it.path.slice(prefix.length) : it.path;
+        const localPath = normalizePath(cfg.localPath ? cfg.localPath + '/' + key : key);
+        const { blob } = await isogit.git.readBlob({ fs: fsp, dir: CLONE_DIR, oid: it.oid });
+        await this.ensureDirFor(localPath);
+        await this.app.vault.adapter.writeBinary(localPath, blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength));
+        written++;
+        notice.setMessage(this.t('write_progress', { i: written, n: targets.length }));
+        if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('write_progress', { i: written, n: targets.length }));
       }
-    };
-    await walkTree(commit.commit.tree, '');
-    const prefix = cfg.remotePath ? cfg.remotePath.replace(/\/+$/, '') + '/' : '';
-    const targets = all.filter((it) => {
-      if (it.path.split('/').includes('..')) return false; // 防越界
-      const key = prefix ? (it.path.startsWith(prefix) ? it.path.slice(prefix.length) : null) : it.path;
-      if (key === null || key === '') return false;
-      return !matchAny(key, cfg.matchers);
-    });
-    let written = 0;
-    for (const it of targets) {
-      if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
-      const key = prefix ? it.path.slice(prefix.length) : it.path;
-      const localPath = normalizePath(cfg.localPath ? cfg.localPath + '/' + key : key);
-      const { blob } = await isogit.git.readBlob({ fs: fsp, dir: CLONE_DIR, oid: it.oid });
-      await this.ensureDirFor(localPath);
-      await this.app.vault.adapter.writeBinary(localPath, blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength));
-      written++;
-      notice.setMessage(this.t('write_progress', { i: written, n: targets.length }));
-      if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('write_progress', { i: written, n: targets.length }));
+      const vS = Math.max(1, Math.round((t1 - t0) / 1000));
+      const cS = Math.max(1, Math.round((t2 - t1) / 1000));
+      const wS = Math.max(1, Math.round((Date.now() - t2) / 1000));
+      notice.hide();
+      // 分段耗时：手机端 87s 类问题的现场仪表——验证/下载/写盘哪段慢一眼可辨
+      new Notice(this.t('clone_ok', { n: written, m: all.length - targets.length, v: vS, c: cS, w: wS }), 8000);
+      console.log(`[${PLUGIN_ID}] clone: verify=${vS}s clone=${cS}s write=${wS}s (${written} files)`);
+    } finally {
+      try {
+        await this.fsRmrf(fsp, CLONE_DIR + '/.git');
+        await fsp.promises.rmdir(CLONE_DIR + '/.git'); // fsRmrf 只清内容，目录壳补删
+      } catch (e) { /* 已不存在等场景忽略 */ }
     }
-    const secs = Math.max(1, Math.round((Date.now() - t0) / 1000));
-    notice.hide();
-    new Notice(this.t('clone_ok', { n: written, m: all.length - targets.length, s: secs }), 6000);
   }
 
   /** 增量同步（移动端大仓专用）：tree API 拿全量清单 → 与本地 manifest 按 blob sha 对比 → 限速逐文件下载。
