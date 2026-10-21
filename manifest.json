@@ -1,7 +1,7 @@
 {
   "id": "xu-git-pull",
   "name": "XU Git Pull",
-  "version": "1.8.4",
+  "version": "1.8.5",
   "minAppVersion": "1.13.0",
   "description": "远程资料拉取：从 GitHub/GitCode/Gitee 公开或私有仓库整仓浅克隆，按过滤规则一键覆盖更新到本地 vault，手机平板单向同步资料.",
   "author": "旭说",

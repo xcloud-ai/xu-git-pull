@@ -114,3 +114,38 @@
 /* 下载模式帮助弹窗标题（替代 createEl('hN')——审核合规） */
 .xgp-help-title { font-size: 18px; font-weight: 600; margin: 0 0 16px; }
 .xgp-help-h { font-size: 14px; font-weight: 600; margin: 10px 0 2px; }
+
+/* 下载模式分段开关（全量覆盖 / 限速增量，互斥单选） */
+.xgp-seg {
+  display: flex;
+  gap: 0;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: var(--radius-s, 6px);
+  overflow: hidden;
+}
+
+.xgp-seg-btn {
+  border: none;
+  border-right: 1px solid var(--background-modifier-border);
+  background: var(--background-secondary);
+  color: var(--text-muted);
+  padding: 4px 12px;
+  font-size: var(--font-ui-small);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.xgp-seg-btn:last-child {
+  border-right: none;
+}
+
+.xgp-seg-btn:hover {
+  color: var(--text-normal);
+  background: var(--background-secondary-hover);
+}
+
+.xgp-seg-btn.is-active {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  cursor: default;
+}

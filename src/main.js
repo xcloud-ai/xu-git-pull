@@ -163,6 +163,7 @@ const I18N = {
     setting_exclude_desc: '已内置排除 .git/、.trash/、community-plugins.json、workspace.json（设备本地状态，同步有弊无利）；此处可追加，** 匹配任意层级目录，* 匹配单层名称',
     action_pull: '立即拉取',
     action_pull_desc: '验证远程仓库后整仓克隆并覆盖更新',
+    incr_first_clone: '首次使用限速模式：先克隆建底账（全量落盘），下次起逐文件增量',
     setting_token: '{name} Token',
     setting_token_desc: '私有库必填，公开库可不填。填写后下方仓库、分支、子目录自动加载为下拉选择，无需手填。各平台令牌独立保存在本设备 data.json 中，切换平台互不影响。建议使用只读权限的最小授权令牌。',
     ph_github: 'github_pat_…',
@@ -253,6 +254,7 @@ const I18N = {
     setting_exclude_desc: 'Built-in: .git/, .trash/, community-plugins.json, workspace.json (device-local state — never sync these). Add more here. ** matches any depth, * a single segment.',
     action_pull: 'Pull now',
     action_pull_desc: 'Verify the remote repo, then clone and overwrite',
+    incr_first_clone: 'First run in rate-limited mode: cloning to build the manifest (full write). Next runs go file-by-file incremental',
     setting_token: '{name} token',
     setting_token_desc: 'Required for private repos, optional for public. Once set, repository, branch and subfolder become dropdowns — no typing. Tokens are stored per platform in local data.json; switching platforms never mixes them. A minimal read-only token is recommended.',
     ph_github: 'github_pat_…',
@@ -599,6 +601,7 @@ class GitPullPlugin extends Plugin {
         return !matchAny(key, cfg.matchers);
       });
       let written = 0;
+      const manifestMap = {}; // path→blob sha：克隆即建增量底账（1.8.5），下次限速模式直接增量
       for (const it of targets) {
         if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
         const key = prefix ? it.path.slice(prefix.length) : it.path;
@@ -606,10 +609,16 @@ class GitPullPlugin extends Plugin {
         const { blob } = await isogit.git.readBlob({ fs: fsp, dir: CLONE_DIR, oid: it.oid });
         await this.ensureDirFor(localPath);
         await this.app.vault.adapter.writeBinary(localPath, blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength));
+        manifestMap[it.path] = it.oid;
         written++;
         notice.setMessage(this.t('write_progress', { i: written, n: targets.length }));
         if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('write_progress', { i: written, n: targets.length }));
       }
+      // 落盘底账：与增量模式同格式（ref + files），限速模式下次起真增量
+      try {
+        await this.ensureDirFor(this.manifestKey(cfg.owner, cfg.repo));
+        await this.app.vault.adapter.write(this.manifestKey(cfg.owner, cfg.repo), JSON.stringify({ ref: cfg.ref || 'HEAD', files: manifestMap }));
+      } catch (e) { /* 底账失败只影响下次增量效率，不影响本次结果 */ }
       const vS = Math.max(1, Math.round((t1 - t0) / 1000));
       const cS = Math.max(1, Math.round((t2 - t1) / 1000));
       const wS = Math.max(1, Math.round((Date.now() - t2) / 1000));
@@ -625,8 +634,15 @@ class GitPullPlugin extends Plugin {
     }
   }
 
+  /** 增量底账路径（克隆建账与增量续传共用）：平台-仓库-子目录 slug，切范围互不干扰 */
+  manifestKey(owner, repo) {
+    const rpSlug = ((this.settings.remotePath || '').replace(/^\/+|\/+$/g, '').replace(/[^a-zA-Z0-9._-]+/g, '-') || 'root');
+    return normalizePath('.xu-git-pull/' + (this.settings.platform || 'github') + '-' + owner + '-' + repo + '-' + rpSlug + '.json');
+  }
+
   /** 增量同步（移动端大仓专用）：tree API 拿全量清单 → 与本地 manifest 按 blob sha 对比 → 限速逐文件下载。
-   *  内存占用 O(单文件)，永不 OOM；manifest 记在 vault/.xu-git-pull/（换设备可续传），每 20 个文件落盘断点。 */
+   *  内存占用 O(单文件)，永不 OOM；manifest 记在 vault/.xu-git-pull/（换设备可续传），每 20 个文件落盘断点。
+   *  首次使用（无底账）：自动走一次克隆——全量落盘 + 生成 path→sha 底账，之后每次都是真增量（1.8.5）。 */
   async pullIncremental(cfg, notice) {
     const owner = cfg.owner;
     const repo = cfg.repo;
@@ -638,6 +654,12 @@ class GitPullPlugin extends Plugin {
       throw Object.assign(new Error(this.t('notice_ref_not_found', { ref: cfg.ref })), { code: 'verify' });
     }
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
+    // 首次无底账 → 一次克隆建底账（全量落盘），下次起才是逐文件增量
+    if (!(await this.app.vault.adapter.exists(this.manifestKey(owner, repo)))) {
+      notice.setMessage(this.t('incr_first_clone'));
+      await this.pullViaClone(cfg, notice);
+      return;
+    }
 
     // ① 全量文件清单（tree API：GitHub/Gitee 单请求，GitCode 分页自动翻页合并）
     notice.setMessage(this.t('incr_tree'));
@@ -663,8 +685,7 @@ class GitPullPlugin extends Plugin {
 
     // ③ 本地 manifest（上次成功下载的 path→sha 快照；换分支/换子目录则重置全量重下）
     // mKey 含子目录 slug：切换 remotePath 后新旧范围互不干扰，避免误删旧范围文件
-    const rpSlug = ((this.settings.remotePath || '').replace(/^\/+|\/+$/g, '').replace(/[^a-zA-Z0-9._-]+/g, '-') || 'root');
-    const mKey = normalizePath('.xu-git-pull/' + (this.settings.platform || 'github') + '-' + owner + '-' + repo + '-' + rpSlug + '.json');
+    const mKey = this.manifestKey(owner, repo);
     let manifest = { ref: refName, files: {} };
     try {
       const prev = JSON.parse(await this.app.vault.adapter.read(mKey));
@@ -1064,21 +1085,6 @@ class GitPullSettingTab extends PluginSettingTab {
     return [
       // 头部说明（empty 定义，不进搜索）
       { name: p.t('setting_title'), desc: p.t('setting_header_desc'), searchable: false },
-      // 语言切换（render 回调 + update 重绘）
-      {
-        name: p.t('setting_language'),
-        render: (setting) => {
-          setting.addDropdown((d) => {
-            d.addOptions({ zh: p.t('lang_zh'), en: p.t('lang_en') });
-            d.setValue(p.settings.language);
-            d.onChange(async (v) => {
-              p.settings.language = v;
-              await p.saveSettings();
-              this.update();
-            });
-          });
-        },
-      },
       {
         type: 'group',
         heading: p.t('sec_repo'),
@@ -1134,6 +1140,60 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_remote_path'), desc: p.t('setting_remote_path_desc'), render: (setting) => this.renderFolderSelect(setting) },
           // 6. 本地目录仍用原生选择器
           { name: p.t('setting_local_path'), desc: p.t('setting_local_path_desc'), control: { type: 'folder', key: 'localPath', placeholder: '/', includeRoot: true } },
+          // 7. 下载模式：全量覆盖（默认）/ 限速增量——分段开关（图 2 样式），按平台记忆双端互不干扰
+          {
+            name: p.t('setting_download_mode'),
+            desc: p.t('setting_download_mode_desc'),
+            render: (setting) => {
+              const platKey = Platform.isMobile ? 'mobile' : 'desktop';
+              const cur = (p.settings.downloadMode && p.settings.downloadMode[platKey]) || 'clone';
+              setting.controlEl.empty();
+              const wrap = setting.controlEl.createEl('div', { cls: 'xgp-seg' });
+              const mk = (modeKey, label) => {
+                const btn = wrap.createEl('button', { cls: 'xgp-seg-btn' + (cur === modeKey ? ' is-active' : '') });
+                btn.setText(label);
+                btn.setAttribute('aria-pressed', cur === modeKey ? 'true' : 'false');
+                btn.addEventListener('click', async () => {
+                  if ((p.settings.downloadMode && p.settings.downloadMode[platKey]) === modeKey) return; // 已选中
+                  p.settings.downloadMode = p.settings.downloadMode || {};
+                  p.settings.downloadMode[platKey] = modeKey;
+                  await p.saveSettings();
+                  this.update(); // 重绘：分段高亮切换 + 限速项条件显隐
+                });
+              };
+              mk('clone', p.t('mode_full'));
+              mk('incremental', p.t('mode_incr'));
+              setting.addButton((b) => {
+                b.setButtonText('?');
+                b.setTooltip(p.t('btn_help'));
+                b.onClick(() => new DownloadModeHelpModal(p).open());
+              });
+            },
+          },
+          // 8. 限速值（仅限速增量模式显示；预填当前平台建议值，可改，0 = 全速）
+          ...((((p.settings.downloadMode || {})[Platform.isMobile ? 'mobile' : 'desktop']) || 'clone') === 'incremental'
+            ? [{
+                name: p.t('setting_rate') + '（' + this.platformBareName(p) + '）',
+                desc: (p.t('mode_incr_desc').split('；')[1] || '') + ' · GitCode 40 / GitHub 60 / Gitee 50，0 = 全速',
+                render: (setting) => {
+                  const plat = p.settings.platform || 'github';
+                  setting.addText((text) => {
+                    text.inputEl.type = 'number';
+                    text.inputEl.min = '0';
+                    text.inputEl.max = '600';
+                    const rp = p.settings.ratePerMin || {};
+                    text.setValue(String(rp[plat] != null ? rp[plat] : ''));
+                    text.setPlaceholder(String(DEFAULT_SETTINGS.ratePerMin[plat] || 40));
+                    text.onChange((v) => {
+                      p.settings.ratePerMin = p.settings.ratePerMin || {};
+                      const n = Math.max(0, Math.min(600, parseInt(v, 10) || 0));
+                      p.settings.ratePerMin[plat] = n;
+                      void p.saveSettings();
+                    });
+                  });
+                },
+              }]
+            : []),
         ],
       },
       {
@@ -1144,65 +1204,7 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_exclude'), desc: p.t('setting_exclude_desc'), control: { type: 'textarea', key: 'exclude', rows: 3 } },
         ],
       },
-      // 立即拉取（action 行）
-      { name: p.t('action_pull'), desc: p.t('action_pull_desc'), action: () => { void p.pull(); } },
-      // 下载模式：全量覆盖（默认）/ 限速增量——按平台记忆，双端各自设置互不干扰
-      {
-        name: p.t('setting_download_mode'),
-        desc: p.t('setting_download_mode_desc'),
-        render: (setting) => {
-          const platKey = Platform.isMobile ? 'mobile' : 'desktop';
-          const cur = (p.settings.downloadMode && p.settings.downloadMode[platKey]) || 'clone';
-          setting.addButton((b) => {
-            b.setButtonText(p.t('mode_full') + (cur === 'clone' ? ' ✓' : ''));
-            b.setCta(cur === 'clone');
-            b.onClick(async () => {
-              p.settings.downloadMode = p.settings.downloadMode || {};
-              p.settings.downloadMode[platKey] = 'clone';
-              await p.saveSettings();
-              this.update();
-            });
-          });
-          setting.addButton((b) => {
-            b.setButtonText(p.t('mode_incr') + (cur === 'incremental' ? ' ✓' : ''));
-            b.setCta(cur === 'incremental');
-            b.onClick(async () => {
-              p.settings.downloadMode = p.settings.downloadMode || {};
-              p.settings.downloadMode[platKey] = 'incremental';
-              await p.saveSettings();
-              this.update();
-            });
-          });
-          setting.addButton((b) => {
-            b.setButtonText('?');
-            b.setTooltip(p.t('btn_help'));
-            b.onClick(() => new DownloadModeHelpModal(p).open());
-          });
-        },
-      },
-      // 限速值（选限速增量时才有意义；预填当前平台建议值，可改，0 = 全速）
-      {
-        name: p.t('setting_rate') + '（' + this.platformBareName(p) + '）',
-        desc: (p.t('mode_incr_desc').split('；')[1] || '') + ' · GitCode 40 / GitHub 60 / Gitee 50，0 = 全速',
-        render: (setting) => {
-          const plat = p.settings.platform || 'github';
-          setting.addText((text) => {
-            text.inputEl.type = 'number';
-            text.inputEl.min = '0';
-            text.inputEl.max = '600';
-            const rp = p.settings.ratePerMin || {};
-            text.setValue(String(rp[plat] != null ? rp[plat] : ''));
-            text.setPlaceholder(String(DEFAULT_SETTINGS.ratePerMin[plat] || 40));
-            text.onChange((v) => {
-              p.settings.ratePerMin = p.settings.ratePerMin || {};
-              const n = Math.max(0, Math.min(600, parseInt(v, 10) || 0));
-              p.settings.ratePerMin[plat] = n;
-              void p.saveSettings();
-            });
-          });
-        },
-      },
-      // GitHub 文档入口（页面底部统一）
+      // GitHub 文档入口
       {
         name: p.t('setting_docs'),
         render: (setting) => {
@@ -1212,6 +1214,23 @@ class GitPullSettingTab extends PluginSettingTab {
           });
         },
       },
+      // 界面语言（页面底部低频项）
+      {
+        name: p.t('setting_language'),
+        render: (setting) => {
+          setting.addDropdown((d) => {
+            d.addOptions({ zh: p.t('lang_zh'), en: p.t('lang_en') });
+            d.setValue(p.settings.language);
+            d.onChange(async (v) => {
+              p.settings.language = v;
+              await p.saveSettings();
+              this.update();
+            });
+          });
+        },
+      },
+      // 立即拉取（页面最底：行为跟随上方所选下载模式）
+      { name: p.t('action_pull'), desc: p.t('action_pull_desc'), action: () => { void p.pull(); } },
     ];
   }
 
