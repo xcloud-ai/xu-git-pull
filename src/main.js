@@ -113,8 +113,6 @@ const I18N = {
     mode_full_desc: '整仓克隆后覆盖写入，速度最快（大库十几秒）；内存占用约仓库体积 2 倍，桌面端推荐',
     mode_incr: '限速增量',
     mode_incr_desc: '逐个下载有变更的文件，内存占用极小；限速防平台限流，支持断点续传；手机/大仓推荐',
-    setting_download_mode: '下载模式',
-    setting_download_mode_desc: '全量覆盖为默认；手机端如遇闪退请改用限速增量',
     setting_rate: '每分钟请求数',
     btn_help: '帮助',
     help_title: '下载模式说明',
@@ -204,8 +202,6 @@ const I18N = {
     mode_full_desc: 'Clone whole repo then overwrite — fastest (a large repo in seconds); uses ~2x repo size in memory. Recommended on desktop.',
     mode_incr: 'Throttled incremental',
     mode_incr_desc: 'Download only changed files one by one — tiny memory footprint; throttled to avoid platform rate limits, with resume support. Recommended on phones / large repos.',
-    setting_download_mode: 'Download mode',
-    setting_download_mode_desc: 'Full clone is the default; if the app crashes on your phone, switch to throttled incremental',
     setting_rate: 'Requests per minute',
     btn_help: 'Help',
     help_title: 'Download modes explained',
@@ -1155,40 +1151,51 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_remote_path'), desc: p.t('setting_remote_path_desc'), render: (setting) => this.renderFolderSelect(setting) },
           // 6. 本地目录仍用原生选择器
           { name: p.t('setting_local_path'), desc: p.t('setting_local_path_desc'), control: { type: 'folder', key: 'localPath', placeholder: '/', includeRoot: true } },
-          // 7. 下载模式：全量覆盖（默认）/ 限速增量——胶囊滑动开关（与 .obsidian 开关同风格：
-          //    轨道 + 滑块，两格标签，选中侧滑块滑过去高亮），按平台记忆双端互不干扰
+          // 7. 全量覆盖开关（原生 toggle）：默认模式，不允许关闭——关=回弹保持选中，切换入口在限速开关
           {
-            name: p.t('setting_download_mode'),
-            desc: p.t('setting_download_mode_desc'),
+            name: p.t('mode_full'),
+            desc: p.t('mode_full_desc'),
             render: (setting) => {
               const platKey = Platform.isMobile ? 'mobile' : 'desktop';
-              const cur = (p.settings.downloadMode && p.settings.downloadMode[platKey]) || 'clone';
-              setting.controlEl.empty();
-              const wrap = setting.controlEl.createEl('div', { cls: 'xgp-switch' + (cur === 'incremental' ? ' xgp-switch--right' : '') });
-              wrap.setAttribute('role', 'radiogroup');
-              wrap.createEl('div', { cls: 'xgp-switch-thumb' }); // 滑块：CSS 控制 translateX
-              const mk = (modeKey, label) => {
-                const btn = wrap.createEl('button', { cls: 'xgp-switch-opt' + (cur === modeKey ? ' is-active' : '') });
-                btn.setText(label);
-                btn.setAttribute('aria-pressed', cur === modeKey ? 'true' : 'false');
-                btn.addEventListener('click', async () => {
-                  if ((p.settings.downloadMode && p.settings.downloadMode[platKey]) === modeKey) return; // 已选中
+              const isClone = ((p.settings.downloadMode || {})[platKey]) !== 'incremental'; // 缺省即 clone
+              setting.addToggle((tg) => {
+                tg.setValue(isClone);
+                tg.onChange(async (v) => {
+                  if (v === isClone) return;
+                  if (!v) { this.update(); return; } // 默认模式不可关：重绘回弹
                   p.settings.downloadMode = p.settings.downloadMode || {};
-                  p.settings.downloadMode[platKey] = modeKey;
+                  p.settings.downloadMode[platKey] = 'clone';
                   await p.saveSettings();
-                  this.update(); // 重绘：滑块切换 + 限速项条件显隐
+                  this.update();
                 });
-              };
-              mk('clone', p.t('mode_full'));
-              mk('incremental', p.t('mode_incr'));
-              setting.addButton((b) => {
+              });
+              setting.addExtraButton((b) => {
                 b.setButtonText('?');
                 b.setTooltip(p.t('btn_help'));
                 b.onClick(() => new DownloadModeHelpModal(p).open());
               });
             },
           },
-          // 8. 限速值（仅限速增量模式显示；预填当前平台建议值，可改，0 = 全速）
+          // 8. 限速增量开关（原生 toggle）：开=增量，关=回到全量覆盖；限速值随之显隐
+          {
+            name: p.t('mode_incr'),
+            desc: p.t('mode_incr_desc'),
+            render: (setting) => {
+              const platKey = Platform.isMobile ? 'mobile' : 'desktop';
+              const isIncr = ((p.settings.downloadMode || {})[platKey]) === 'incremental';
+              setting.addToggle((tg) => {
+                tg.setValue(isIncr);
+                tg.onChange(async (v) => {
+                  if (v === isIncr) return;
+                  p.settings.downloadMode = p.settings.downloadMode || {};
+                  p.settings.downloadMode[platKey] = v ? 'incremental' : 'clone';
+                  await p.saveSettings();
+                  this.update();
+                });
+              });
+            },
+          },
+          // 9. 限速值（仅限速增量模式显示；预填当前平台建议值，可改，0 = 全速）
           ...((((p.settings.downloadMode || {})[Platform.isMobile ? 'mobile' : 'desktop']) || 'clone') === 'incremental'
             ? [{
                 name: p.t('setting_rate') + '（' + this.platformBareName(p) + '）',
