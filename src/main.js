@@ -1155,7 +1155,8 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_remote_path'), desc: p.t('setting_remote_path_desc'), render: (setting) => this.renderFolderSelect(setting) },
           // 6. 本地目录仍用原生选择器
           { name: p.t('setting_local_path'), desc: p.t('setting_local_path_desc'), control: { type: 'folder', key: 'localPath', placeholder: '/', includeRoot: true } },
-          // 7. 下载模式：全量覆盖（默认）/ 限速增量——分段开关（图 2 样式），按平台记忆双端互不干扰
+          // 7. 下载模式：全量覆盖（默认）/ 限速增量——胶囊滑动开关（与 .obsidian 开关同风格：
+          //    轨道 + 滑块，两格标签，选中侧滑块滑过去高亮），按平台记忆双端互不干扰
           {
             name: p.t('setting_download_mode'),
             desc: p.t('setting_download_mode_desc'),
@@ -1163,9 +1164,11 @@ class GitPullSettingTab extends PluginSettingTab {
               const platKey = Platform.isMobile ? 'mobile' : 'desktop';
               const cur = (p.settings.downloadMode && p.settings.downloadMode[platKey]) || 'clone';
               setting.controlEl.empty();
-              const wrap = setting.controlEl.createEl('div', { cls: 'xgp-seg' });
+              const wrap = setting.controlEl.createEl('div', { cls: 'xgp-switch' + (cur === 'incremental' ? ' xgp-switch--right' : '') });
+              wrap.setAttribute('role', 'radiogroup');
+              wrap.createEl('div', { cls: 'xgp-switch-thumb' }); // 滑块：CSS 控制 translateX
               const mk = (modeKey, label) => {
-                const btn = wrap.createEl('button', { cls: 'xgp-seg-btn' + (cur === modeKey ? ' is-active' : '') });
+                const btn = wrap.createEl('button', { cls: 'xgp-switch-opt' + (cur === modeKey ? ' is-active' : '') });
                 btn.setText(label);
                 btn.setAttribute('aria-pressed', cur === modeKey ? 'true' : 'false');
                 btn.addEventListener('click', async () => {
@@ -1173,7 +1176,7 @@ class GitPullSettingTab extends PluginSettingTab {
                   p.settings.downloadMode = p.settings.downloadMode || {};
                   p.settings.downloadMode[platKey] = modeKey;
                   await p.saveSettings();
-                  this.update(); // 重绘：分段高亮切换 + 限速项条件显隐
+                  this.update(); // 重绘：滑块切换 + 限速项条件显隐
                 });
               };
               mk('clone', p.t('mode_full'));
