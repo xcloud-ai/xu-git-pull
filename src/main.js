@@ -1085,6 +1085,21 @@ class GitPullSettingTab extends PluginSettingTab {
     return [
       // 头部说明（empty 定义，不进搜索）
       { name: p.t('setting_title'), desc: p.t('setting_header_desc'), searchable: false },
+      // 界面语言（页面顶部：切语言立即全页重绘）
+      {
+        name: p.t('setting_language'),
+        render: (setting) => {
+          setting.addDropdown((d) => {
+            d.addOptions({ zh: p.t('lang_zh'), en: p.t('lang_en') });
+            d.setValue(p.settings.language);
+            d.onChange(async (v) => {
+              p.settings.language = v;
+              await p.saveSettings();
+              this.update();
+            });
+          });
+        },
+      },
       {
         type: 'group',
         heading: p.t('sec_repo'),
@@ -1204,7 +1219,9 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_exclude'), desc: p.t('setting_exclude_desc'), control: { type: 'textarea', key: 'exclude', rows: 3 } },
         ],
       },
-      // GitHub 文档入口
+      // 立即拉取（行为跟随上方所选下载模式）
+      { name: p.t('action_pull'), desc: p.t('action_pull_desc'), action: () => { void p.pull(); } },
+      // 使用文档（页面最底：低频入口）
       {
         name: p.t('setting_docs'),
         render: (setting) => {
@@ -1214,23 +1231,6 @@ class GitPullSettingTab extends PluginSettingTab {
           });
         },
       },
-      // 界面语言（页面底部低频项）
-      {
-        name: p.t('setting_language'),
-        render: (setting) => {
-          setting.addDropdown((d) => {
-            d.addOptions({ zh: p.t('lang_zh'), en: p.t('lang_en') });
-            d.setValue(p.settings.language);
-            d.onChange(async (v) => {
-              p.settings.language = v;
-              await p.saveSettings();
-              this.update();
-            });
-          });
-        },
-      },
-      // 立即拉取（页面最底：行为跟随上方所选下载模式）
-      { name: p.t('action_pull'), desc: p.t('action_pull_desc'), action: () => { void p.pull(); } },
     ];
   }
 
