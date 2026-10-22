@@ -1070,9 +1070,29 @@ class GitPullSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this._tgFull = null; // 全量覆盖 ToggleComponent 引用（兄弟开关同步用）
+    this._tgIncr = null; // 限速增量 ToggleComponent 引用
+    this._xgpModeBusy = false; // 模式切换重入锁
   }
 
   t(key, params) { return this.plugin.t(key, params); }
+
+  // 下载模式切换（双开关互斥核心，1.8.9）：toggle 的 change 事件栈内绝不调用 this.update()——
+  // 同步重绘会与声明式渲染器重入堆叠（1.8.8 无限循环 bug）。改为：
+  //   1) 兄弟开关用组件引用程序化 setValue 同步（不触发 onChange，即时视觉互斥）
+  //   2) saveSettings 后延迟 30ms 在事件栈外重绘（刷新限速行 visible），加重入锁兜底
+  _applyMode(platKey, mode) {
+    if (this._xgpModeBusy) return;
+    this._xgpModeBusy = true;
+    const p = this.plugin;
+    p.settings.downloadMode = p.settings.downloadMode || {};
+    p.settings.downloadMode[platKey] = mode;
+    if (this._tgFull) this._tgFull.setValue(mode !== 'incremental');
+    if (this._tgIncr) this._tgIncr.setValue(mode === 'incremental');
+    void p.saveSettings().then(() => {
+      setTimeout(() => { this._xgpModeBusy = false; this.update(); }, 30);
+    });
+  }
 
   getSettingDefinitions() {
     const p = this.plugin;
@@ -1151,7 +1171,7 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_remote_path'), desc: p.t('setting_remote_path_desc'), render: (setting) => this.renderFolderSelect(setting) },
           // 6. 本地目录仍用原生选择器
           { name: p.t('setting_local_path'), desc: p.t('setting_local_path_desc'), control: { type: 'folder', key: 'localPath', placeholder: '/', includeRoot: true } },
-          // 7. 全量覆盖开关（原生 toggle）：默认模式，不允许关闭——关=回弹保持选中，切换入口在限速开关
+          // 7. 全量覆盖开关（原生 toggle）：默认模式，不允许关闭——关=程序化回弹，切换入口在限速开关
           {
             name: p.t('mode_full'),
             desc: p.t('mode_full_desc'),
@@ -1159,14 +1179,12 @@ class GitPullSettingTab extends PluginSettingTab {
               const platKey = Platform.isMobile ? 'mobile' : 'desktop';
               const isClone = ((p.settings.downloadMode || {})[platKey]) !== 'incremental'; // 缺省即 clone
               setting.addToggle((tg) => {
+                this._tgFull = tg;
                 tg.setValue(isClone);
-                tg.onChange(async (v) => {
+                tg.onChange((v) => {
                   if (v === isClone) return;
-                  if (!v) { this.update(); return; } // 默认模式不可关：重绘回弹
-                  p.settings.downloadMode = p.settings.downloadMode || {};
-                  p.settings.downloadMode[platKey] = 'clone';
-                  await p.saveSettings();
-                  this.update();
+                  if (!v) { tg.setValue(true); return; } // 默认模式不可关：就地回弹（不重绘）
+                  this._applyMode(platKey, 'clone');
                 });
               });
               setting.addExtraButton((b) => {
@@ -1176,7 +1194,7 @@ class GitPullSettingTab extends PluginSettingTab {
               });
             },
           },
-          // 8. 限速增量开关（原生 toggle）：开=增量，关=回到全量覆盖；限速值随之显隐
+          // 8. 限速增量开关（原生 toggle）：开=增量，关=回到全量覆盖；互斥由 _applyMode 保证
           {
             name: p.t('mode_incr'),
             desc: p.t('mode_incr_desc'),
@@ -1184,41 +1202,38 @@ class GitPullSettingTab extends PluginSettingTab {
               const platKey = Platform.isMobile ? 'mobile' : 'desktop';
               const isIncr = ((p.settings.downloadMode || {})[platKey]) === 'incremental';
               setting.addToggle((tg) => {
+                this._tgIncr = tg;
                 tg.setValue(isIncr);
-                tg.onChange(async (v) => {
+                tg.onChange((v) => {
                   if (v === isIncr) return;
-                  p.settings.downloadMode = p.settings.downloadMode || {};
-                  p.settings.downloadMode[platKey] = v ? 'incremental' : 'clone';
-                  await p.saveSettings();
-                  this.update();
+                  this._applyMode(platKey, v ? 'incremental' : 'clone');
                 });
               });
             },
           },
-          // 9. 限速值（仅限速增量模式显示；预填当前平台建议值，可改，0 = 全速）
-          ...((((p.settings.downloadMode || {})[Platform.isMobile ? 'mobile' : 'desktop']) || 'clone') === 'incremental'
-            ? [{
-                name: p.t('setting_rate') + '（' + this.platformBareName(p) + '）',
-                desc: (p.t('mode_incr_desc').split('；')[1] || '') + ' · GitCode 40 / GitHub 60 / Gitee 50，0 = 全速',
-                render: (setting) => {
-                  const plat = p.settings.platform || 'github';
-                  setting.addText((text) => {
-                    text.inputEl.type = 'number';
-                    text.inputEl.min = '0';
-                    text.inputEl.max = '600';
-                    const rp = p.settings.ratePerMin || {};
-                    text.setValue(String(rp[plat] != null ? rp[plat] : ''));
-                    text.setPlaceholder(String(DEFAULT_SETTINGS.ratePerMin[plat] || 40));
-                    text.onChange((v) => {
-                      p.settings.ratePerMin = p.settings.ratePerMin || {};
-                      const n = Math.max(0, Math.min(600, parseInt(v, 10) || 0));
-                      p.settings.ratePerMin[plat] = n;
-                      void p.saveSettings();
-                    });
-                  });
-                },
-              }]
-            : []),
+          // 9. 限速值（visible 谓词：仅限速增量模式显示；defs 恒定 9 项，预填平台建议值，0 = 全速）
+          {
+            name: p.t('setting_rate') + '（' + this.platformBareName(p) + '）',
+            desc: (p.t('mode_incr_desc').split('；')[1] || '') + ' · GitCode 40 / GitHub 60 / Gitee 50，0 = 全速',
+            visible: () => ((((p.settings.downloadMode || {})[Platform.isMobile ? 'mobile' : 'desktop']) || 'clone') === 'incremental'),
+            render: (setting) => {
+              const plat = p.settings.platform || 'github';
+              setting.addText((text) => {
+                text.inputEl.type = 'number';
+                text.inputEl.min = '0';
+                text.inputEl.max = '600';
+                const rp = p.settings.ratePerMin || {};
+                text.setValue(String(rp[plat] != null ? rp[plat] : ''));
+                text.setPlaceholder(String(DEFAULT_SETTINGS.ratePerMin[plat] || 40));
+                text.onChange((v) => {
+                  p.settings.ratePerMin = p.settings.ratePerMin || {};
+                  const n = Math.max(0, Math.min(600, parseInt(v, 10) || 0));
+                  p.settings.ratePerMin[plat] = n;
+                  void p.saveSettings();
+                });
+              });
+            },
+          },
         ],
       },
       {
