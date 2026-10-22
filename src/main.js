@@ -97,7 +97,7 @@ const I18N = {
     clone_verified: '验证通过：{repo}（{ref}），开始整仓克隆…',
     clone_progress: '克隆中… {s}s',
     write_progress: '写入 {i}/{n}',
-    clone_ok: '拉取完成：写入 {n} 个文件（过滤 {m} 个）· 验证 {v}s + 下载 {c}s + 写盘 {w}s',
+    clone_ok: '拉取完成：写入 {n} 个文件（跳过未变 {s} 个·过滤 {m} 个）· 验证 {v}s + 下载 {c}s + 写盘 {w}s',
     clone_fail: '克隆失败：{reason}',
     notice_ref_not_found: '分支不存在：{ref}',
     notice_aborted_simple: '已取消',
@@ -120,7 +120,7 @@ const I18N = {
     setting_rate: '每分钟请求数',
     btn_help: '帮助',
     help_title: '下载模式说明',
-    help_clone: '全量覆盖（默认）\n· 整仓克隆，约 2 个网络请求，速度最快\n· 内存占用约为仓库体积的 2 倍\n· 桌面端推荐；手机端大仓库（如上百 MB）可能内存不足闪退\n· 仓库整体覆盖写入（含远程删除清理）',
+    help_clone: '全量覆盖（默认）\n· 整仓克隆，约 2 个网络请求，速度最快\n· 内存占用约为仓库体积的 2 倍\n· 桌面端推荐；手机端大仓库（如上百 MB）可能内存不足闪退\n· 覆盖写入远端有变化的文件，本地一致的跳过；不删除任何本地文件',
     help_incr: '限速增量\n· 只下载有变更的文件，内存占用极小\n· 按每分钟 N 个文件限速，避免触发平台限流\n· 支持断点续传：中断后下次接着传\n· 远程已删除的文件会同步清理',
     help_rate: '限速建议值\n· GitCode：40/分（实测约 50/分触发限流，留余量）\n· GitHub：60/分\n· Gitee：50/分\n· 0 = 全速（不推荐，大仓易触发 429 限流）',
     help_cancel: '拉取过程中可点击状态栏 ⬇ 取消；限速增量的进度已保存，下次自动续传',
@@ -133,7 +133,7 @@ const I18N = {
     incr_done: '增量同步完成：更新 {n} 个、清理远程已删除 {d} 个（{m} 个无变更跳过），耗时 {s}s',
     incr_skipped: '已跳过 {n} 个超大文件（>20MB，移动端内存限制）：{list}',
     setting_title: 'XU Git Pull（远程资料拉取）',
-    setting_header_desc: '从远程仓库（支持私有库）单向拉取文件到本 vault：按仓库体积自动选择整仓克隆覆盖或增量同步（含远程删除清理），适合手机/平板只看资料的场景。',
+    setting_header_desc: '从远程仓库（支持私有库）单向拉取文件到本 vault：全量克隆覆盖更新，或增量同步只拉变更（远程已删除文件在增量模式下同步清理），适合手机/平板只看资料的场景。',
     setting_language: '界面语言',
     lang_zh: '中文',
     lang_en: 'English',
@@ -190,7 +190,7 @@ const I18N = {
     clone_verified: 'Verified: {repo} ({ref}). Cloning…',
     clone_progress: 'Cloning… {s}s',
     write_progress: 'Writing {i}/{n}',
-    clone_ok: 'Done: {n} file(s) ({m} filtered) — verify {v}s + download {c}s + write {w}s',
+    clone_ok: 'Done: {n} written ({s} unchanged skipped, {m} filtered) — verify {v}s + download {c}s + write {w}s',
     clone_fail: 'Clone failed: {reason}',
     notice_ref_not_found: 'Branch not found: {ref}',
     notice_aborted_simple: 'Cancelled',
@@ -213,7 +213,7 @@ const I18N = {
     setting_rate: 'Requests per minute',
     btn_help: 'Help',
     help_title: 'Download modes explained',
-    help_clone: 'Full clone (default)\n- Clone the whole repo in ~2 requests — fastest\n- Uses ~2x repo size in memory\n- Recommended on desktop; large repos (100MB+) may crash mobile apps\n- Overwrites vault files including remote deletions',
+    help_clone: 'Full clone (default)\n- Clone the whole repo in ~2 requests — fastest\n- Uses ~2x repo size in memory\n- Recommended on desktop; large repos (100MB+) may crash mobile apps\n- Overwrites files changed on the remote; locally unchanged files are hash-checked and skipped; nothing is deleted locally',
     help_incr: 'Throttled incremental\n- Downloads only changed files, tiny memory footprint\n- Throttled to N files/min to avoid platform rate limits\n- Resume support: interrupted downloads continue next time\n- Remotely deleted files are cleaned up locally',
     help_rate: 'Suggested throttle values\n- GitCode: 40/min (~50/min triggers rate limit, keep margin)\n- GitHub: 60/min\n- Gitee: 50/min\n- 0 = full speed (not recommended; large repos will hit 429)',
     help_cancel: 'Tap the ⬇ status-bar item to cancel mid-pull; incremental progress is saved and resumes automatically',
@@ -442,8 +442,15 @@ class GitPullPlugin extends Plugin {
       return this.apiGetJson(base + '?recursive=1');
     }
     const merged = [];
-    const fetchPage = (page) =>
-      this.apiGetJson(base + '?recursive=1&per_page=100&page=' + page).catch(() => ({ tree: [] }));
+    const fetchPage = async (page) => {
+      let lastErr = null;
+      for (let t = 0; t < 3; t++) {
+        try { return await this.apiGetJson(base + '?recursive=1&per_page=100&page=' + page); }
+        catch (e) { lastErr = e; await sleep(400 * (t + 1)); }
+      }
+      // 翻页失败绝不伪装成「最后一页」——残缺清单会让增量模式把本地文件误判为远端已删
+      throw lastErr;
+    };
     let page = 1;
     let more = true;
     while (more && merged.length <= 20000) {
@@ -456,7 +463,8 @@ class GitPullPlugin extends Plugin {
         if (items.length < 100) more = false; // 短页=最后一页
       }
     }
-    return { tree: merged, truncated: false };
+    // 触顶静默截断同样危险：超出部分不在清单里会被当成已删，如实上报让调用方中止
+    return { tree: merged.slice(0, 20000), truncated: merged.length > 20000 };
   }
 
   /** 当前平台的令牌（按平台独立存储，切换平台互不影响） */
@@ -530,16 +538,21 @@ class GitPullPlugin extends Plugin {
     return { refs: (info && info.refs) || {} };
   }
 
-  /** ②③ 整仓克隆 → 过滤 → 写盘 → 汇总。抛错由调用方决定回退/终止 */
+  /** ②③ 整仓克隆 → 过滤 → 对账跳写 → 差集清理 → 汇总。抛错由调用方决定回退/终止 */
   async pullViaClone(cfg, notice) {
     const url = this.gitRemoteUrl(cfg.owner, cfg.repo);
-    const t0 = Date.now();
+    let vS = 0; // 验证段耗时；未指定分支时跳过验证 = 0
 
-    // ① 验证：分支校验（未指定分支时 isomorphic-git 跟随远程默认）
-    notice.setMessage(this.t('clone_checking'));
-    const { refs } = await this.verifyRemote(url);
-    if (cfg.ref && !(refs.heads && refs.heads[cfg.ref] !== undefined)) {
-      throw Object.assign(new Error(this.t('notice_ref_not_found', { ref: cfg.ref })), { code: 'verify' });
+    // ① 验证：仅「指定分支」时 ls-remote 校验分支存在（1 个请求）；未指定分支时
+    //    clone 会自动跟随远程默认分支，ls-remote 结果用不上——直接跳过省一次往返（1.8.12）
+    if (cfg.ref) {
+      notice.setMessage(this.t('clone_checking'));
+      const tv = Date.now();
+      const { refs } = await this.verifyRemote(url);
+      if (!(refs.heads && refs.heads[cfg.ref] !== undefined)) {
+        throw Object.assign(new Error(this.t('notice_ref_not_found', { ref: cfg.ref })), { code: 'verify' });
+      }
+      vS = Math.max(1, Math.round((Date.now() - tv) / 1000));
     }
     const ref = cfg.ref || undefined;
     const refLabel = cfg.ref || this.t('ref_default');
@@ -578,7 +591,7 @@ class GitPullPlugin extends Plugin {
       if (timeoutId) clearTimeout(timeoutId);
     }
 
-    // ③ 遍历提交树（noCheckout 模式无工作区）→ 过滤 → 逐 blob 读对象写 vault（精确进度）
+    // ③ 遍历提交树（noCheckout 模式无工作区）→ 过滤 → 对账跳写 → 差集清理 → 写 vault（精确进度）
     //    写盘段包 try/finally：无论成功/失败/取消，结束即删 /repo/.git——
     //    git 对象（264MB 级）不再常驻 IndexedDB，下次克隆前 fsRmrf 瞬时完成
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
@@ -604,16 +617,24 @@ class GitPullPlugin extends Plugin {
         if (key === null || key === '') return false;
         return !matchAny(key, cfg.matchers);
       });
+      // 镜像写盘（1.8.12）：本地内容哈希对账——算本地文件的 git blob oid 与远端比对，
+      // 一致才跳过（跳过的是「内容确实相同」，含远端未变+本地也没动）；本地改过的一律覆盖写
       let written = 0;
+      let skipped = 0;
       const manifestMap = {}; // path→blob sha：克隆即建增量底账（1.8.5），下次限速模式直接增量
       for (const it of targets) {
         if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
         const key = prefix ? it.path.slice(prefix.length) : it.path;
+        manifestMap[it.path] = it.oid; // 跳写与否都记入新账，保持账完整
         const localPath = normalizePath(cfg.localPath ? cfg.localPath + '/' + key : key);
+        try {
+          const buf = await this.app.vault.adapter.readBinary(localPath);
+          const { oid: localOid } = await isogit.git.hashBlob({ object: new Uint8Array(buf) });
+          if (localOid === it.oid) { skipped++; continue; } // 本地与远端逐字节一致：连 readBlob 都不做
+        } catch (e) { /* 本地不存在/读取失败 → 覆盖写 */ }
         const { blob } = await isogit.git.readBlob({ fs: fsp, dir: CLONE_DIR, oid: it.oid });
         await this.ensureDirFor(localPath);
         await this.app.vault.adapter.writeBinary(localPath, blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength));
-        manifestMap[it.path] = it.oid;
         written++;
         notice.setMessage(this.t('write_progress', { i: written, n: targets.length }));
         if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('write_progress', { i: written, n: targets.length }));
@@ -623,13 +644,12 @@ class GitPullPlugin extends Plugin {
         await this.ensureDirFor(this.manifestKey(cfg.owner, cfg.repo));
         await this.app.vault.adapter.write(this.manifestKey(cfg.owner, cfg.repo), JSON.stringify({ ref: cfg.ref || 'HEAD', files: manifestMap }));
       } catch (e) { /* 底账失败只影响下次增量效率，不影响本次结果 */ }
-      const vS = Math.max(1, Math.round((t1 - t0) / 1000));
       const cS = Math.max(1, Math.round((t2 - t1) / 1000));
       const wS = Math.max(1, Math.round((Date.now() - t2) / 1000));
       notice.hide();
       // 分段耗时：手机端 87s 类问题的现场仪表——验证/下载/写盘哪段慢一眼可辨
-      new Notice(this.t('clone_ok', { n: written, m: all.length - targets.length, v: vS, c: cS, w: wS }), 8000);
-      console.log(`[${PLUGIN_ID}] clone: verify=${vS}s clone=${cS}s write=${wS}s (${written} files)`);
+      new Notice(this.t('clone_ok', { n: written, m: all.length - targets.length, s: skipped, v: vS, c: cS, w: wS }), 8000);
+      console.log(`[${PLUGIN_ID}] clone: verify=${vS}s clone=${cS}s write=${wS}s (${written} written, ${skipped} skipped)`);
     } finally {
       try {
         await this.fsRmrf(fsp, CLONE_DIR + '/.git');
@@ -702,7 +722,7 @@ class GitPullPlugin extends Plugin {
     const goneKeys = Object.keys(manifest.files).filter((p) => !have.has(p));
     let deleted = 0;
     if (goneKeys.length > 0) {
-      const lp = (this.settings.localPath || '').replace(/\/+$/, '');
+      const lp = cfg.localPath || ''; // 与写盘同源（trimSlashes 双侧裁剪），避免设置原值带前导斜杠/空格时删除目标错位
       for (const gp of goneKeys) {
         const key = prefix ? (gp.startsWith(prefix) ? gp.slice(prefix.length) : null) : gp;
         delete manifest.files[gp];

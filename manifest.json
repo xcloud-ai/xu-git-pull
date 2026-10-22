@@ -1,9 +1,9 @@
 {
   "id": "xu-git-pull",
   "name": "XU Git Pull",
-  "version": "1.8.11",
+  "version": "1.8.12",
   "minAppVersion": "1.13.0",
-  "description": "远程资料拉取：从 GitHub/GitCode/Gitee 公开或私有仓库整仓浅克隆，按过滤规则一键覆盖更新到本地 vault，手机平板单向同步资料.",
+  "description": "远程资料拉取：从 GitHub/GitCode/Gitee 公开或私有仓库单向拉取资料到 vault，全量覆盖与限速增量两种模式任选，手机平板只看不回传.",
   "author": "旭说",
   "isDesktopOnly": false,
   "authorUrl": "https://github.com/xcloud-ai"

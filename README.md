@@ -1,20 +1,21 @@
 # 远程资料拉取
 
 > [!NOTE] 中文说明
-> **远程资料拉取**：把 GitHub / GitCode / Gitee 仓库里的笔记和资料一键下载到手机、平板的 Obsidian 中查看，整仓克隆、一键覆盖，只下载不回传。
+> **远程资料拉取**：把 GitHub / GitCode / Gitee 仓库里的笔记和资料一键下载到手机、平板的 Obsidian 中查看，全量覆盖与限速增量两种模式任选，只下载不回传。
 
-典型用法：电脑端把 Obsidian 笔记持续推送到远程仓库（GitHub / GitCode / Gitee），手机和平板只负责**看**。本插件不做双向同步、不在移动端维护长期 git 仓库，而是通过 git smart HTTP 对远程仓库做一次**浅克隆（depth=1，约 2 个请求拉全仓）**，按过滤规则把文件覆盖写入 vault 后即清理克隆数据——移动端不受 API 限流影响，专为「电脑推、移动看」的单向场景设计。
+典型用法：电脑端把 Obsidian 笔记持续推送到远程仓库（GitHub / GitCode / Gitee），手机和平板只负责**看**。本插件不做双向同步、不在移动端维护长期 git 仓库，而是通过 git smart HTTP 对远程仓库做一次**浅克隆（depth=1，约 2 个请求拉全仓）**，按过滤规则把文件覆盖写入 vault 后即清理克隆数据——移动端不受 API 限流影响。另提供**限速增量**模式：与上次下载底账对比，只下载远端有变更的文件，按每分钟 N 个限速、支持断点续传，内存占用极小，适合超大仓库或平台限流场景；两种模式随时切换。
 
 > English description below for review purposes. / 以下为英文说明，用于过审。
 
-**XU Git Pull** downloads notes one-way from a GitHub / GitCode / Gitee repository (public or private) into a phone or tablet vault for reading. It performs a shallow git clone (depth=1, roughly 2 HTTP requests for the whole repo) over smart HTTP, then writes the fetched files into the vault according to your filter rules and cleans up afterwards — immune to hosting-platform API rate limits, and built for the "write on desktop, read on mobile" one-way scenario.
+**XU Git Pull** downloads notes one-way from a GitHub / GitCode / Gitee repository (public or private) into a phone or tablet vault for reading. It performs a shallow git clone (depth=1, roughly 2 HTTP requests for the whole repo) over smart HTTP, then writes the fetched files into the vault according to your filter rules and cleans up afterwards — immune to hosting-platform API rate limits, and built for the "write on desktop, read on mobile" one-way scenario. A throttled incremental mode is also available: it compares against the last-sync ledger and downloads only files changed on the remote, throttled to N files per minute with resume support and a tiny memory footprint.
 
 ## 功能特性
 
 - **移动端查看优先**：电脑端推送远程仓库，手机/平板点一下即可获得最新资料，无需电脑、无需 git 客户端
+- **双下载模式**：全量覆盖（整仓克隆，最快）与限速增量（逐文件限速 + 断点续传，内存占用极小）二选一，随时切换
 - **整仓克隆、不限流**：git 浅克隆约 2 个请求拉全仓，数千文件也不再触发平台 API 限流；克隆完成后按规则过滤写入
 - **进度可见、随时取消**：克隆阶段显示计时心跳，写盘阶段显示精确进度（n/总数），点击状态栏或通知即可取消
-- **只增改、不删除**：远程删掉的文件本地保留；移动端本地文件不会被误删，也永远不会上传任何内容
+- **数据安全**：全量覆盖模式只写入有变化的文件（本地内容哈希一致即跳过），不删除任何本地文件；限速增量模式会同步清理远程已删除的文件；两种模式都永远不会上传任何内容
 - **私有库支持**：填写平台 Token 即可拉取私有仓库（GitHub 推荐 fine-grained 只读令牌，Gitee/GitCode 用私人令牌）
 - **Token 级联下拉**：填入 Token 后，仓库、分支、子目录全部自动加载为下拉框，全程只选不填，避免输错
 - **安全过滤**：默认排除 `.obsidian/` 配置目录（可开关），始终排除 `.git/`、`.trash/`，支持自定义 glob 排除规则
@@ -25,7 +26,8 @@
 - Built for reading on phones and tablets: pull the latest notes from GitHub / GitCode / Gitee with one tap, no git client required
 - Shallow git clone fetches the whole repo in roughly 2 requests — no more platform API rate limits even with thousands of files; files are filtered into the vault after cloning
 - Visible progress: heartbeat during clone, precise file count during write-out, tap to cancel at any time
-- One-way only: files are added or updated, never deleted, and nothing is ever uploaded
+- Two download modes: full clone (fastest) or throttled incremental (per-file rate limit with resume, tiny memory footprint)
+- Data safety: full-clone mode writes only changed files (hash-checked locally, nothing is deleted); incremental mode also removes files deleted on the remote; nothing is ever uploaded
 - Private repositories supported via a fine-grained read-only token
 - Cascading dropdowns for repository, branch and subfolder after entering a token — pick, don't type
 - Includes `.obsidian/` by default (toggleable), always excludes `.git/` and `.trash/`, custom glob patterns supported
@@ -37,7 +39,7 @@
 |---|---|
 | 把远程仓库（GitHub / GitCode / Gitee）的资料拉到本地查看 | 不上传、不回传本地修改 |
 | 整仓克隆后一键覆盖更新 | 不做三方合并、不处理冲突 |
-| 只增改文件，不删除本地文件 | 不同步删除操作 |
+| 全量模式只增改不删除；增量模式同步远程删除 | 不上传、不回传本地修改 |
 | 克隆数据写盘后即清理，不留 `.git` 目录 | 不提供提交历史、分支管理 |
 | 适合：电脑端写、移动端看 | 不适合：移动端也要编辑并同步回电脑（请用 obsidian-git 等双向同步方案） |
 
@@ -86,7 +88,7 @@ You can also install the beta with [BRAT](https://github.com/TfTHacker/obsidian4
 4. **分支**：下拉选择分支（默认分支 = 最新内容）
 5. **仓库内子目录**（可选）：只拉某个文件夹；本地目标目录（可选）：在 vault 中的存放位置
 6. 点击左侧边栏下载图标（或命令面板搜索「拉取远程文件」）
-7. 插件先验证远程仓库可访问，随即整仓克隆并按过滤规则覆盖写入，完成后通知汇总（新增 n / 更新 m），即可阅读
+7. 插件按所选模式拉取：全量覆盖 = 验证 + 整仓克隆 + 哈希对账写盘（内容未变的文件自动跳过）；限速增量 = 与上次底账对比只下载变更文件（首次自动克隆建账）。完成后通知汇总，即可阅读
 
 日常使用只有一步：打开 vault → 点下载图标 → 等完成通知。
 
@@ -105,7 +107,7 @@ You can also install the beta with [BRAT](https://github.com/TfTHacker/obsidian4
 1. Push notes from your computer to a remote repository (GitHub / GitCode / Gitee, public or private)
 2. On the phone/tablet, open XU Git Pull settings, pick the platform and paste a token (required for private repos; buttons copy the link and open the docs/creation page), then pick the repository, branch and optional subfolder from the dropdowns
 3. Tap the download ribbon icon (or run "Pull remote files" from the command palette)
-4. The plugin verifies the remote repository, shallow-clones it and overwrites local files according to your filter rules, then shows a summary notice when done
+4. The plugin pulls according to the selected mode: full clone = verify + shallow clone + hash-checked write-out (unchanged files skipped); throttled incremental = downloads only changed files against the last-sync ledger (first run auto-clones). A summary notice appears when done
 
 The plugin is one-way: it only adds or updates local files, never uploads or deletes.
 
@@ -120,6 +122,8 @@ The plugin is one-way: it only adds or updates local files, never uploads or del
 | 分支 | 下拉选择远程分支；留空项「默认分支（最新）」跟随仓库默认分支 |
 | 仓库内子目录 | 下拉选择后只拉取该目录；「/（整个仓库）」为默认 |
 | 本地目标目录 | 下载到 vault 中的位置，留空为 vault 根目录 |
+| 下载模式 | 全量覆盖 / 限速增量，二选一互斥开关，各平台独立记忆 |
+| 每分钟请求数 | 仅限速增量模式显示；GitCode 建议 40、GitHub 60、Gitee 50，0 = 全速 |
 | 下载 .obsidian 配置目录 | 默认开启，同步 `.obsidian/`（插件与外观配置跟随仓库）；不希望覆盖本机配置时手动关闭 |
 | 额外排除规则 | 每行一条 glob，`**` 匹配任意层级；`.git/`、`.trash/` 始终排除 |
 
@@ -134,7 +138,9 @@ The plugin is one-way: it only adds or updates local files, never uploads or del
 - 通过 git smart HTTP 对远程仓库做浅克隆（depth=1）：`info/refs?service=git-upload-pack` + `upload-pack` 两个请求拉全仓，与 REST API 是两套独立配额，实测 GitCode 连发多次零限流
 - 三平台（GitHub / GitCode / Gitee）git 协议认证统一为 Basic `oauth2:<令牌>`，克隆链路完全一致；GitCode 275MB / 6014 文件大仓与 Gitee 真实仓库均已实测通过
 - 克隆由内置的 isomorphic-git（v1.44.2）+ LightningFS 完成，全部打包进 main.js，零外部 require 依赖，桌面/移动端行为一致；克隆数据写入内存级 IndexedDB 文件系统，写盘完成后清理
-- 写盘按过滤规则执行：始终排除 `.git/`、`.trash/`，`.obsidian/` 默认同步（可开关关闭），支持自定义 glob；克隆中新文件先落盘，远程已删除的本地文件保留不动
+- 写盘按过滤规则执行：始终排除 `.git/`、`.trash/`，`.obsidian/` 默认同步（可开关关闭），支持自定义 glob
+- 写盘哈希对账（1.8.12）：本地文件逐个计算 git blob SHA-1 与远端比对，内容一致直接跳过（省读省写），本地改过或新增的文件才写入；全量模式不删除任何本地文件
+- 限速增量链路：tree API 拉全量清单（GitCode 自动翻页，单页失败自动退避重试、仍失败立即中止，绝不因残缺清单误删本地文件）→ 与底账对比 → blobs API 逐文件下载（429 自动等待）→ 每 20 个文件落盘断点、中断续传；单文件超过 20MB 自动跳过（移动端内存保护）
 - 设置页级联下拉（仓库/分支/子目录）仍走各平台 REST API 并按令牌缓存，仅低频调用
 - 克隆超时 5 分钟；拉取中点击状态栏 ⬇ 即可取消（克隆完成后跳过写入）；401/403/404 等验证失败均有中文错误提示
 - 无 Node/Electron 专有 API，`isDesktopOnly: false`，支持 iOS/iPadOS/Android
