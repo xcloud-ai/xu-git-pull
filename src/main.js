@@ -1171,7 +1171,7 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_remote_path'), desc: p.t('setting_remote_path_desc'), render: (setting) => this.renderFolderSelect(setting) },
           // 6. 本地目录仍用原生选择器
           { name: p.t('setting_local_path'), desc: p.t('setting_local_path_desc'), control: { type: 'folder', key: 'localPath', placeholder: '/', includeRoot: true } },
-          // 7. 全量覆盖开关（原生 toggle）：默认模式，不允许关闭——关=程序化回弹，切换入口在限速开关
+          // 7. 全量覆盖开关（原生 toggle）：与限速开关组成单选——关=切到限速增量，开=回全量
           {
             name: p.t('mode_full'),
             desc: p.t('mode_full_desc'),
@@ -1183,11 +1183,12 @@ class GitPullSettingTab extends PluginSettingTab {
                 tg.setValue(isClone);
                 tg.onChange((v) => {
                   if (v === isClone) return;
-                  if (!v) { tg.setValue(true); return; } // 默认模式不可关：就地回弹（不重绘）
-                  this._applyMode(platKey, 'clone');
+                  this._applyMode(platKey, v ? 'clone' : 'incremental'); // 单选语义：两个方向都自由切换
                 });
               });
-              setting.addExtraButton((b) => {
+              // 帮助按钮必须用 addButton（ExtraButtonComponent 是纯图标件，无 setButtonText，
+              // 调用即 TypeError → 声明式渲染器中止 → 后续所有设置行消失，1.8.10 实证）
+              setting.addButton((b) => {
                 b.setButtonText('?');
                 b.setTooltip(p.t('btn_help'));
                 b.onClick(() => new DownloadModeHelpModal(p).open());
