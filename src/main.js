@@ -109,10 +109,14 @@ const I18N = {
     notice_cancelling: '取消中…（克隆完成后跳过写入）',
     statusbar_cancel_hint: '点击取消拉取',
     incremental_hint: '限速增量同步：{rpm} 个/分钟，只下载有变更的文件，支持断点续传',
+    mode_title: '下载模式',
+    mode_pick_one: '任选其一',
     mode_full: '全量覆盖',
     mode_full_desc: '整仓克隆后覆盖写入，速度最快（大库十几秒）；内存占用约仓库体积 2 倍，桌面端推荐',
     mode_incr: '限速增量',
     mode_incr_desc: '逐个下载有变更的文件，内存占用极小；限速防平台限流，支持断点续传；手机/大仓推荐',
+    mode_must_one: '必须选择一个下载模式',
+    mode_only_one: '只能选择一个下载模式，已自动取消另一项',
     setting_rate: '每分钟请求数',
     btn_help: '帮助',
     help_title: '下载模式说明',
@@ -198,10 +202,14 @@ const I18N = {
     notice_cancelling: 'Cancelling… (writing will be skipped)',
     statusbar_cancel_hint: 'Click to cancel the pull',
     incremental_hint: 'Incremental sync: {rpm} files/min, only changed files are downloaded, with resume support.',
+    mode_title: 'Download mode',
+    mode_pick_one: 'Choose one of the two',
     mode_full: 'Full clone',
     mode_full_desc: 'Clone whole repo then overwrite — fastest (a large repo in seconds); uses ~2x repo size in memory. Recommended on desktop.',
     mode_incr: 'Throttled incremental',
     mode_incr_desc: 'Download only changed files one by one — tiny memory footprint; throttled to avoid platform rate limits, with resume support. Recommended on phones / large repos.',
+    mode_must_one: 'You must select one download mode',
+    mode_only_one: 'Only one mode can be selected — the other has been unchecked automatically',
     setting_rate: 'Requests per minute',
     btn_help: 'Help',
     help_title: 'Download modes explained',
@@ -1070,25 +1078,35 @@ class GitPullSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
-    this._tgFull = null; // 全量覆盖 ToggleComponent 引用（兄弟开关同步用）
+    this._tgFull = null; // 全量覆盖 ToggleComponent 引用（校验式互斥用）
     this._tgIncr = null; // 限速增量 ToggleComponent 引用
     this._xgpModeBusy = false; // 模式切换重入锁
   }
 
   t(key, params) { return this.plugin.t(key, params); }
 
-  // 下载模式切换（双开关互斥核心，1.8.9）：toggle 的 change 事件栈内绝不调用 this.update()——
-  // 同步重绘会与声明式渲染器重入堆叠（1.8.8 无限循环 bug）。改为：
-  //   1) 兄弟开关用组件引用程序化 setValue 同步（不触发 onChange，即时视觉互斥）
-  //   2) saveSettings 后延迟 30ms 在事件栈外重绘（刷新限速行 visible），加重入锁兜底
-  _applyMode(platKey, mode) {
+  // 下载模式切换（校验式二选一，1.8.11）：toggle 的 change 事件栈内绝不调用 this.update()——
+  // 同步重绘会与声明式渲染器重入堆叠（1.8.8 无限循环 bug）。两条规则泾渭分明：
+  //   勾选一个且对方也亮（瞬间「选中所有」）→ 提示「只能选一个」+ 对方自动取消（新勾的赢）
+  //   关掉唯一亮着的（「全部取消」）→ 提示「必须选一个」，保持双灭等待用户勾选，存储模式不变
+  // 兄弟开关用组件引用程序化 setValue（不触发 onChange）；改存储后延迟 30ms 在事件栈外
+  // 重绘（刷新限速行 visible），加重入锁兜底
+  _onModeToggle(platKey, mode, v) {
+    const other = mode === 'clone' ? this._tgIncr : this._tgFull;
+    const otherOn = !!(other && other.getValue());
+    if (!v) {
+      if (!otherOn) new Notice(this.plugin.t('mode_must_one')); // 全部取消：等待用户勾选其一
+      return; // 对方亮着时本开关熄灭仍是有效单选态（存储即对方模式），无需改动
+    }
+    if (otherOn) {
+      new Notice(this.plugin.t('mode_only_one')); // 选中所有：只能选一个
+      other.setValue(false); // 对方自动取消
+    }
     if (this._xgpModeBusy) return;
     this._xgpModeBusy = true;
     const p = this.plugin;
     p.settings.downloadMode = p.settings.downloadMode || {};
     p.settings.downloadMode[platKey] = mode;
-    if (this._tgFull) this._tgFull.setValue(mode !== 'incremental');
-    if (this._tgIncr) this._tgIncr.setValue(mode === 'incremental');
     void p.saveSettings().then(() => {
       setTimeout(() => { this._xgpModeBusy = false; this.update(); }, 30);
     });
@@ -1171,21 +1189,11 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_remote_path'), desc: p.t('setting_remote_path_desc'), render: (setting) => this.renderFolderSelect(setting) },
           // 6. 本地目录仍用原生选择器
           { name: p.t('setting_local_path'), desc: p.t('setting_local_path_desc'), control: { type: 'folder', key: 'localPath', placeholder: '/', includeRoot: true } },
-          // 7. 全量覆盖开关（原生 toggle）：与限速开关组成单选——关=切到限速增量，开=回全量
+          // 7. 下载模式标题行：？帮助按钮集中在此行（1.8.11），下方两开关组成校验式二选一
           {
-            name: p.t('mode_full'),
-            desc: p.t('mode_full_desc'),
+            name: p.t('mode_title'),
+            desc: p.t('mode_pick_one'),
             render: (setting) => {
-              const platKey = Platform.isMobile ? 'mobile' : 'desktop';
-              const isClone = ((p.settings.downloadMode || {})[platKey]) !== 'incremental'; // 缺省即 clone
-              setting.addToggle((tg) => {
-                this._tgFull = tg;
-                tg.setValue(isClone);
-                tg.onChange((v) => {
-                  if (v === isClone) return;
-                  this._applyMode(platKey, v ? 'clone' : 'incremental'); // 单选语义：两个方向都自由切换
-                });
-              });
               // 帮助按钮必须用 addButton（ExtraButtonComponent 是纯图标件，无 setButtonText，
               // 调用即 TypeError → 声明式渲染器中止 → 后续所有设置行消失，1.8.10 实证）
               setting.addButton((b) => {
@@ -1195,24 +1203,33 @@ class GitPullSettingTab extends PluginSettingTab {
               });
             },
           },
-          // 8. 限速增量开关（原生 toggle）：开=增量，关=回到全量覆盖；互斥由 _applyMode 保证
+          // 8. 全量覆盖开关（原生 toggle）：与限速开关二选一，互斥/校验规则见 _onModeToggle
+          {
+            name: p.t('mode_full'),
+            desc: p.t('mode_full_desc'),
+            render: (setting) => {
+              const platKey = Platform.isMobile ? 'mobile' : 'desktop';
+              setting.addToggle((tg) => {
+                this._tgFull = tg;
+                tg.setValue(((p.settings.downloadMode || {})[platKey]) !== 'incremental'); // 缺省即 clone
+                tg.onChange((v) => this._onModeToggle(platKey, 'clone', v));
+              });
+            },
+          },
+          // 9. 限速增量开关（原生 toggle）：与全量开关二选一，互斥/校验规则见 _onModeToggle
           {
             name: p.t('mode_incr'),
             desc: p.t('mode_incr_desc'),
             render: (setting) => {
               const platKey = Platform.isMobile ? 'mobile' : 'desktop';
-              const isIncr = ((p.settings.downloadMode || {})[platKey]) === 'incremental';
               setting.addToggle((tg) => {
                 this._tgIncr = tg;
-                tg.setValue(isIncr);
-                tg.onChange((v) => {
-                  if (v === isIncr) return;
-                  this._applyMode(platKey, v ? 'incremental' : 'clone');
-                });
+                tg.setValue(((p.settings.downloadMode || {})[platKey]) === 'incremental');
+                tg.onChange((v) => this._onModeToggle(platKey, 'incremental', v));
               });
             },
           },
-          // 9. 限速值（visible 谓词：仅限速增量模式显示；defs 恒定 9 项，预填平台建议值，0 = 全速）
+          // 10. 限速值（visible 谓词：仅限速增量模式显示；defs 恒定 10 项，预填平台建议值，0 = 全速）
           {
             name: p.t('setting_rate') + '（' + this.platformBareName(p) + '）',
             desc: (p.t('mode_incr_desc').split('；')[1] || '') + ' · GitCode 40 / GitHub 60 / Gitee 50，0 = 全速',
