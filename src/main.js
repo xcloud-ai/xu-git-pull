@@ -378,6 +378,24 @@ class GitPullPlugin extends Plugin {
     for (const pf of Object.keys(this.settings.profiles)) {
       this.settings.profiles[pf] = Object.assign(defaultProfile(), this.settings.profiles[pf] || {});
     }
+    // 旧版格式迁移：<1.8.2 的 downloadMode 是单字符串、<1.8.5 的 ratePerMin 是单数字。
+    // 浅合并会原样保留旧格式——字符串上取键恒为 undefined，pull() 永远落回全量克隆，
+    // 设置页开关在字符串上赋属性抛 TypeError、保存链路断裂（持久化失效）。一次性迁为对象并落盘。
+    let legacyFmt = false;
+    if (typeof this.settings.downloadMode === 'string') {
+      const legacyMode = this.settings.downloadMode === 'incremental' ? 'incremental' : 'clone';
+      this.settings.downloadMode = { desktop: legacyMode, mobile: legacyMode };
+      legacyFmt = true;
+    } else if (!this.settings.downloadMode || typeof this.settings.downloadMode !== 'object') {
+      this.settings.downloadMode = Object.assign({}, DEFAULT_SETTINGS.downloadMode);
+    }
+    if (typeof this.settings.ratePerMin === 'number') {
+      this.settings.ratePerMin = { github: this.settings.ratePerMin, gitcode: this.settings.ratePerMin, gitee: this.settings.ratePerMin };
+      legacyFmt = true;
+    } else if (!this.settings.ratePerMin || typeof this.settings.ratePerMin !== 'object') {
+      this.settings.ratePerMin = Object.assign({}, DEFAULT_SETTINGS.ratePerMin);
+    }
+    if (legacyFmt) void this.saveSettings();
     // 旧版单 token 字段迁移（历史配置只可能是 GitHub Token）
     if (this.settings.token) {
       if (!this.settings.tokens.github) this.settings.tokens.github = String(this.settings.token).trim();
@@ -1108,7 +1126,7 @@ class GitPullSettingTab extends PluginSettingTab {
     if (this._xgpModeBusy) return;
     this._xgpModeBusy = true;
     const p = this.plugin;
-    p.settings.downloadMode = p.settings.downloadMode || {};
+    if (!p.settings.downloadMode || typeof p.settings.downloadMode !== 'object') p.settings.downloadMode = {}; // 类型守卫：防旧版字符串格式穿透
     p.settings.downloadMode[platKey] = mode;
     void p.saveSettings().then(() => {
       setTimeout(() => { this._xgpModeBusy = false; this.update(); }, 30);
