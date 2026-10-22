@@ -115,3 +115,23 @@
 .xgp-help-title { font-size: 18px; font-weight: 600; margin: 0 0 16px; }
 .xgp-help-h { font-size: 14px; font-weight: 600; margin: 10px 0 2px; }
 
+/* 下载模式标题行的内联 ？ 帮助圆点（1.9.0）：与标题同行、宽度恒为一个字符，手机端不占行 */
+.xgp-help-dot {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 6px;
+  border: 1px solid var(--background-modifier-border);
+  border-radius: 50%;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+  text-align: center;
+  vertical-align: middle;
+  cursor: pointer;
+  flex: 0 0 auto;
+}
+.xgp-help-dot:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
+

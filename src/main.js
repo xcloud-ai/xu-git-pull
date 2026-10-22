@@ -1214,13 +1214,12 @@ class GitPullSettingTab extends PluginSettingTab {
             name: p.t('mode_title'),
             desc: p.t('mode_pick_one'),
             render: (setting) => {
-              // 帮助按钮必须用 addButton（ExtraButtonComponent 是纯图标件，无 setButtonText，
-              // 调用即 TypeError → 声明式渲染器中止 → 后续所有设置行消失，1.8.10 实证）
-              setting.addButton((b) => {
-                b.setButtonText('?');
-                b.setTooltip(p.t('btn_help'));
-                b.onClick(() => new DownloadModeHelpModal(p).open());
-              });
+              // ？以内联小圆点挂在标题名旁（1.9.0）：addButton 在手机端 control 区会被拉伸占满整行；
+              // ExtraButtonComponent 无 setButtonText（1.8.10 雷区），且 control 区方案手机端仍独占一行——
+              // 挂进 nameEl 与「下载模式」天然同行，宽度恒为一个字符，样式走 .xgp-help-dot（CSS 类，非静态样式）
+              const dot = setting.nameEl.createEl('a', { cls: 'xgp-help-dot', text: '?' });
+              dot.setAttribute('aria-label', p.t('btn_help'));
+              dot.addEventListener('click', (e) => { e.preventDefault(); new DownloadModeHelpModal(p).open(); });
             },
           },
           // 8. 全量覆盖开关（原生 toggle）：与限速开关二选一，互斥/校验规则见 _onModeToggle
