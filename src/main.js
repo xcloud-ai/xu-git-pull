@@ -110,18 +110,15 @@ const I18N = {
     statusbar_cancel_hint: '点击取消拉取',
     incremental_hint: '限速增量同步：{rpm} 个/分钟，只下载有变更的文件，支持断点续传',
     mode_title: '下载模式',
-    mode_pick_one: '任选其一',
     mode_full: '全量覆盖',
     mode_full_desc: '整仓克隆后覆盖写入，速度最快（大库十几秒）；内存占用约仓库体积 2 倍，桌面端推荐',
     mode_incr: '限速增量',
     mode_incr_desc: '逐个下载有变更的文件，内存占用极小；限速防平台限流，支持断点续传；手机/大仓推荐',
-    mode_must_one: '必须选择一个下载模式',
-    mode_only_one: '只能选择一个下载模式，已自动取消另一项',
     setting_rate: '每分钟请求数',
     btn_help: '帮助',
     help_title: '下载模式说明',
     help_clone: '全量覆盖（默认）\n· 整仓克隆，约 2 个网络请求，速度最快\n· 内存占用约为仓库体积的 2 倍\n· 桌面端推荐；手机端大仓库（如上百 MB）可能内存不足闪退\n· 覆盖写入远端有变化的文件，本地一致的跳过；不删除任何本地文件',
-    help_incr: '限速增量\n· 只下载有变更的文件，内存占用极小\n· 按每分钟 N 个文件限速，避免触发平台限流\n· 支持断点续传：中断后下次接着传\n· 远程已删除的文件会同步清理',
+    help_incr: '限速增量\n· 只下载有变更的文件，内存占用极小\n· 首次使用（无底账）：逐文件全量下载并建账，之后每次只拉变更\n· 按每分钟 N 个文件限速，避免触发平台限流\n· 支持断点续传：中断后下次接着传\n· 远程已删除的文件会同步清理',
     help_rate: '限速建议值\n· GitCode：40/分（实测约 50/分触发限流，留余量）\n· GitHub：60/分\n· Gitee：50/分\n· 0 = 全速（不推荐，大仓易触发 429 限流）',
     help_cancel: '拉取过程中可点击状态栏 ⬇ 取消；限速增量的进度已保存，下次自动续传',
     clone_fail_mobile_hint: '手机端克隆失败多为内存不足，建议在设置中切换为「限速增量」模式',
@@ -137,7 +134,7 @@ const I18N = {
     setting_language: '界面语言',
     lang_zh: '中文',
     lang_en: 'English',
-    sec_repo: '仓库设置',
+    sec_repo: '仓库',
     setting_platform: '代码托管平台',
     setting_platform_desc: '选择远程仓库所在平台。当前版本已支持 GitHub、GitCode 与 Gitee，其他平台后续按需添加。',
     notice_platform_unsupported: '「{name}」平台将在后续版本支持，当前版本请先选择 GitHub',
@@ -165,7 +162,6 @@ const I18N = {
     setting_exclude_desc: '已内置排除 .git/、.trash/、community-plugins.json、workspace.json（设备本地状态，同步有弊无利）；此处可追加，** 匹配任意层级目录，* 匹配单层名称',
     action_pull: '立即拉取',
     action_pull_desc: '验证远程仓库后整仓克隆并覆盖更新',
-    incr_first_clone: '首次使用限速模式：先克隆建底账（全量落盘），下次起逐文件增量',
     setting_token: '{name} Token',
     setting_token_desc: '私有库必填，公开库可不填。填写后下方仓库、分支、子目录自动加载为下拉选择，无需手填。各平台令牌独立保存在本设备 data.json 中，切换平台互不影响。建议使用只读权限的最小授权令牌。',
     ph_github: 'github_pat_…',
@@ -203,18 +199,15 @@ const I18N = {
     statusbar_cancel_hint: 'Click to cancel the pull',
     incremental_hint: 'Incremental sync: {rpm} files/min, only changed files are downloaded, with resume support.',
     mode_title: 'Download mode',
-    mode_pick_one: 'Choose one of the two',
     mode_full: 'Full clone',
     mode_full_desc: 'Clone whole repo then overwrite — fastest (a large repo in seconds); uses ~2x repo size in memory. Recommended on desktop.',
     mode_incr: 'Throttled incremental',
     mode_incr_desc: 'Download only changed files one by one — tiny memory footprint; throttled to avoid platform rate limits, with resume support. Recommended on phones / large repos.',
-    mode_must_one: 'You must select one download mode',
-    mode_only_one: 'Only one mode can be selected — the other has been unchecked automatically',
     setting_rate: 'Requests per minute',
     btn_help: 'Help',
     help_title: 'Download modes explained',
     help_clone: 'Full clone (default)\n- Clone the whole repo in ~2 requests — fastest\n- Uses ~2x repo size in memory\n- Recommended on desktop; large repos (100MB+) may crash mobile apps\n- Overwrites files changed on the remote; locally unchanged files are hash-checked and skipped; nothing is deleted locally',
-    help_incr: 'Throttled incremental\n- Downloads only changed files, tiny memory footprint\n- Throttled to N files/min to avoid platform rate limits\n- Resume support: interrupted downloads continue next time\n- Remotely deleted files are cleaned up locally',
+    help_incr: 'Throttled incremental\n- Downloads only changed files, tiny memory footprint\n- First run (no ledger): all files downloaded one by one to build the ledger; later runs fetch changes only\n- Throttled to N files/min to avoid platform rate limits\n- Resume support: interrupted downloads continue next time\n- Remotely deleted files are cleaned up locally',
     help_rate: 'Suggested throttle values\n- GitCode: 40/min (~50/min triggers rate limit, keep margin)\n- GitHub: 60/min\n- Gitee: 50/min\n- 0 = full speed (not recommended; large repos will hit 429)',
     help_cancel: 'Tap the ⬇ status-bar item to cancel mid-pull; incremental progress is saved and resumes automatically',
     clone_fail_mobile_hint: 'Clone failures on phones are usually out-of-memory. Consider switching to "Throttled incremental" in settings.',
@@ -258,7 +251,6 @@ const I18N = {
     setting_exclude_desc: 'Built-in: .git/, .trash/, community-plugins.json, workspace.json (device-local state — never sync these). Add more here. ** matches any depth, * a single segment.',
     action_pull: 'Pull now',
     action_pull_desc: 'Verify the remote repo, then clone and overwrite',
-    incr_first_clone: 'First run in rate-limited mode: cloning to build the manifest (full write). Next runs go file-by-file incremental',
     setting_token: '{name} token',
     setting_token_desc: 'Required for private repos, optional for public. Once set, repository, branch and subfolder become dropdowns — no typing. Tokens are stored per platform in local data.json; switching platforms never mixes them. A minimal read-only token is recommended.',
     ph_github: 'github_pat_…',
@@ -666,7 +658,8 @@ class GitPullPlugin extends Plugin {
 
   /** 增量同步（移动端大仓专用）：tree API 拿全量清单 → 与本地 manifest 按 blob sha 对比 → 限速逐文件下载。
    *  内存占用 O(单文件)，永不 OOM；manifest 记在 vault/.xu-git-pull/（换设备可续传），每 20 个文件落盘断点。
-   *  首次使用（无底账）：自动走一次克隆——全量落盘 + 生成 path→sha 底账，之后每次都是真增量（1.8.5）。 */
+   *  无底账（首次/换分支/换设备）：manifest 默认空账 → 全部文件视为变更 → 逐文件限速下载建账。
+   *  全程不调用克隆（1.9.1 彻底分离）——增量任何分支不碰 pullViaClone，手机大仓永不 OOM。 */
   async pullIncremental(cfg, notice) {
     const owner = cfg.owner;
     const repo = cfg.repo;
@@ -678,13 +671,6 @@ class GitPullPlugin extends Plugin {
       throw Object.assign(new Error(this.t('notice_ref_not_found', { ref: cfg.ref })), { code: 'verify' });
     }
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
-    // 首次无底账 → 一次克隆建底账（全量落盘），下次起才是逐文件增量
-    if (!(await this.app.vault.adapter.exists(this.manifestKey(owner, repo)))) {
-      notice.setMessage(this.t('incr_first_clone'));
-      await this.pullViaClone(cfg, notice);
-      return;
-    }
-
     // ① 全量文件清单（tree API：GitHub/Gitee 单请求，GitCode 分页自动翻页合并）
     notice.setMessage(this.t('incr_tree'));
     const data = await this.fetchTreeAll(owner, repo, refName);
@@ -1098,30 +1084,27 @@ class GitPullSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
-    this._tgFull = null; // 全量覆盖 ToggleComponent 引用（校验式互斥用）
+    this._tgFull = null; // 全量覆盖 ToggleComponent 引用（直切互斥用）
     this._tgIncr = null; // 限速增量 ToggleComponent 引用
     this._xgpModeBusy = false; // 模式切换重入锁
   }
 
   t(key, params) { return this.plugin.t(key, params); }
 
-  // 下载模式切换（校验式二选一，1.8.11）：toggle 的 change 事件栈内绝不调用 this.update()——
-  // 同步重绘会与声明式渲染器重入堆叠（1.8.8 无限循环 bug）。两条规则泾渭分明：
-  //   勾选一个且对方也亮（瞬间「选中所有」）→ 提示「只能选一个」+ 对方自动取消（新勾的赢）
-  //   关掉唯一亮着的（「全部取消」）→ 提示「必须选一个」，保持双灭等待用户勾选，存储模式不变
-  // 兄弟开关用组件引用程序化 setValue（不触发 onChange）；改存储后延迟 30ms 在事件栈外
-  // 重绘（刷新限速行 visible），加重入锁兜底
+  // 下载模式切换（直切式二选一，1.9.1）：两个 toggle 恒为一开一关（radio 语义），全程无提示弹窗。
+  // toggle 的 change 事件栈内绝不调用 this.update()——同步重绘会与声明式渲染器重入堆叠（1.8.8 无限循环 bug）。
+  //   勾选一个 → 存储即该模式，兄弟开关程序化 setValue(false) 直接熄灭（不触发 onChange、不弹提示）
+  //   熄灭唯一亮着的 → 静默回弹 setValue(true)：单选态不可清空，可见状态与存储恒一致，
+  //   重开设置页/重启应用后渲染读存储，即上一次的选择（持久化）
+  // 改存储后延迟 30ms 在事件栈外重绘（刷新限速行 visible），加重入锁兜底
   _onModeToggle(platKey, mode, v) {
+    const self = mode === 'clone' ? this._tgFull : this._tgIncr;
     const other = mode === 'clone' ? this._tgIncr : this._tgFull;
-    const otherOn = !!(other && other.getValue());
-    if (!v) {
-      if (!otherOn) new Notice(this.plugin.t('mode_must_one')); // 全部取消：等待用户勾选其一
-      return; // 对方亮着时本开关熄灭仍是有效单选态（存储即对方模式），无需改动
+    if (!v) { // 熄灭亮着的那个：单选态不可清空，静默回弹，存储不变
+      if (self) self.setValue(true);
+      return;
     }
-    if (otherOn) {
-      new Notice(this.plugin.t('mode_only_one')); // 选中所有：只能选一个
-      other.setValue(false); // 对方自动取消
-    }
+    if (other && other.getValue()) other.setValue(false); // 直接关闭另一项（无提示）
     if (this._xgpModeBusy) return;
     this._xgpModeBusy = true;
     const p = this.plugin;
@@ -1209,10 +1192,9 @@ class GitPullSettingTab extends PluginSettingTab {
           { name: p.t('setting_remote_path'), desc: p.t('setting_remote_path_desc'), render: (setting) => this.renderFolderSelect(setting) },
           // 6. 本地目录仍用原生选择器
           { name: p.t('setting_local_path'), desc: p.t('setting_local_path_desc'), control: { type: 'folder', key: 'localPath', placeholder: '/', includeRoot: true } },
-          // 7. 下载模式标题行：？帮助按钮集中在此行（1.8.11），下方两开关组成校验式二选一
+          // 7. 下载模式标题行：？帮助按钮集中在此行（1.8.11）；不放 desc 提示——两开关直切互斥（恒一开一关），语义自明
           {
             name: p.t('mode_title'),
-            desc: p.t('mode_pick_one'),
             render: (setting) => {
               // ？以内联小圆点挂在标题名旁（1.9.0）：addButton 在手机端 control 区会被拉伸占满整行；
               // ExtraButtonComponent 无 setButtonText（1.8.10 雷区），且 control 区方案手机端仍独占一行——
@@ -1222,7 +1204,7 @@ class GitPullSettingTab extends PluginSettingTab {
               dot.addEventListener('click', (e) => { e.preventDefault(); new DownloadModeHelpModal(p).open(); });
             },
           },
-          // 8. 全量覆盖开关（原生 toggle）：与限速开关二选一，互斥/校验规则见 _onModeToggle
+          // 8. 全量覆盖开关（原生 toggle）：与限速开关直切互斥（恒一开一关），规则见 _onModeToggle
           {
             name: p.t('mode_full'),
             desc: p.t('mode_full_desc'),
@@ -1235,7 +1217,7 @@ class GitPullSettingTab extends PluginSettingTab {
               });
             },
           },
-          // 9. 限速增量开关（原生 toggle）：与全量开关二选一，互斥/校验规则见 _onModeToggle
+          // 9. 限速增量开关（原生 toggle）：与全量开关直切互斥（恒一开一关），规则见 _onModeToggle
           {
             name: p.t('mode_incr'),
             desc: p.t('mode_incr_desc'),
