@@ -688,7 +688,19 @@ class GitPullPlugin extends Plugin {
       if (deleted > 0) await this.saveManifestSafe(mKey, manifest);
     }
 
-    const changed = targets.filter((t) => manifest.files[t.path] !== t.sha);
+    // 变更集 = 远端有变（底账 sha 不同）+ 本地缺失（底账最新但本地文件不存在）。
+    // 本地缺失补下（优化点③-lite）：换本地目标目录、误删文件后，增量也能自愈，不再出现
+    // 「底账说无变更而本地是空的」的死角；超大文件从不落盘，缺失不视为需补（见下载循环跳过逻辑）。
+    const BIG_FILE = 20 * 1024 * 1024;
+    const changed = [];
+    for (const t of targets) {
+      if (manifest.files[t.path] !== t.sha) { changed.push(t); continue; }
+      if (t.size > BIG_FILE) continue;
+      try {
+        const fp = normalizePath(cfg.localPath ? cfg.localPath + '/' + t.key : t.key);
+        if (!(await this.app.vault.adapter.exists(fp))) changed.push(t);
+      } catch (e) { changed.push(t); }
+    }
     const t0 = Date.now();
     if (changed.length === 0) {
       notice.hide();
@@ -702,7 +714,6 @@ class GitPullPlugin extends Plugin {
     const rpm = (this.settings.ratePerMin && this.settings.ratePerMin[this.settings.platform]) || 40;
     const gap = rpm > 0 ? Math.ceil(60000 / rpm) : 0;
     const blobBase = this.apiBase() + '/repos/' + owner + '/' + repo + '/git/blobs/';
-    const BIG_FILE = 20 * 1024 * 1024;
     let lastTs = 0;
     let done = 0;
     let dirty = 0;
@@ -834,6 +845,7 @@ class GitPullSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
+    this._autoTried = {}; // autoFillCascades 每 key 一次的尝试标记
   }
 
   display() {
@@ -864,6 +876,7 @@ class GitPullSettingTab extends PluginSettingTab {
         for (const cfg of PLATFORMS) dd.addOption(cfg.id, (cfg.id === 'gitcode' ? '🇨🇳 ' : '🌐 ') + cfg.name);
         dd.setValue(s.platform).onChange(async (v) => {
           s.platform = v;
+          this._autoTried = {}; // 新平台 → 重新自动拉取仓库/分支/目录
           await p.saveSettings();
           this.display();
         });
@@ -883,7 +896,7 @@ class GitPullSettingTab extends PluginSettingTab {
             p.cacheClear('repos:');
             await p.saveSettings();
           });
-        tx.inputEl.addEventListener('blur', () => this.display());
+        tx.inputEl.addEventListener('blur', () => { this._autoTried = {}; this.display(); });
       })
       .addExtraButton((btn) => btn
         .setIcon('file-text')
@@ -899,7 +912,7 @@ class GitPullSettingTab extends PluginSettingTab {
       .setDesc(p.t('set_repo_desc'));
     this.buildCascade(repoSetting, {
       getValue: () => pf.repo || '',
-      setValue: async (v) => { pf.repo = v; await p.saveSettings(); },
+      setValue: async (v) => { pf.repo = v; this._autoTried = {}; await p.saveSettings(); },
       placeholder: p.t('set_repo_placeholder'),
       getCached: () => p.cacheGet('repos:' + p.token()),
       fetchList: async (force) => {
@@ -997,6 +1010,41 @@ class GitPullSettingTab extends PluginSettingTab {
         .setIcon('github')
         .setTooltip(REPO_URL)
         .onClick(() => window.open(REPO_URL)));
+
+    // 渲染完成后后台自动补拉级联列表（仓库/分支/目录），成功后重绘一次
+    void this.autoFillCascades();
+  }
+
+  /** 自动填充级联列表（恢复 1.9.2「打开设置即见列表」体验）：
+   *  有 Token 自动拉仓库列表；有 repo 自动拉分支与子目录。每个 key 每轮设置页会话只尝试一次，
+   *  失败静默（不打扰，手动刷新按钮仍可用），任一成功后重绘一次让下拉出现完整选项。 */
+  async autoFillCascades() {
+    const p = this.plugin;
+    const s = p.settings;
+    const pf = s.profiles[s.platform] || {};
+    const parts = (pf.repo || '').split('/');
+    const owner = parts[0] || '';
+    const repo = parts.slice(1).join('/');
+    const jobs = [];
+    if (p.token() && !p.cacheGet('repos:' + p.token())) {
+      jobs.push({ k: 'repos', run: () => p.fetchRepoList(false) });
+    }
+    if (owner && repo) {
+      const brKey = 'branches:' + (p.token() ? 't' : 'a') + ':' + owner + '/' + repo;
+      const foKey = 'folders:' + (p.token() ? 't' : 'a') + ':' + owner + '/' + repo + '@' + (pf.ref || ':default');
+      if (!p.cacheGet(brKey)) jobs.push({ k: 'br', run: () => p.fetchBranchList(owner, repo, false) });
+      if (!p.cacheGet(foKey)) jobs.push({ k: 'fo', run: () => p.fetchFolderList(owner, repo, pf.ref, false) });
+    }
+    const todo = jobs.filter((j) => !this._autoTried[j.k]);
+    if (!todo.length) return;
+    for (const j of todo) this._autoTried[j.k] = true; // 同步标记，防并发/防循环
+    let filled = false;
+    await Promise.all(todo.map(async (j) => {
+      try { await j.run(); filled = true; } catch (e) {
+        console.warn('[xu-git-pull] 自动加载列表失败(' + j.k + '):', (e && e.message) || e);
+      }
+    }));
+    if (filled) this.display();
   }
 
   /** 仓库级联：下拉（token 列表 + 当前值兜底）+ 刷新按钮；列表不可用时保持手填 */
@@ -1041,6 +1089,7 @@ class GitPullSettingTab extends PluginSettingTab {
       dd.setValue(current);
       dd.selectEl.addEventListener('change', async (ev) => {
         pf.ref = ev.target.value;
+        this._autoTried = {}; // 分支变化 → 子目录列表按新分支重拉
         await p.saveSettings();
       });
       if (!owner || !repo) dd.setDisabled(true);
