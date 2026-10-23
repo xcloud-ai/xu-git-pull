@@ -9,6 +9,7 @@ npx --no-install esbuild src/main.js \
   --format=cjs \
   --platform=browser \
   --target=es2020 \
+  --charset=utf8 \
   --minify \
   --outfile=main.js
 echo "BUILD OK: main.js ($(du -h main.js | cut -f1))"

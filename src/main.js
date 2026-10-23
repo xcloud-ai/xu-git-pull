@@ -1,42 +1,247 @@
-/* XU Git Pull — 远程资料拉取：从 GitHub/GitCode/Gitee（公开/私有）仓库整仓浅克隆，按过滤规则覆盖写入 vault. */
+/* XU Git Pull v2 — 远程资料拉取：从 GitHub/GitCode/Gitee 整仓克隆或限速增量同步到 vault
+ * v2 重写要点：设置页回归经典 display() API（下载模式下拉单选，根治声明式双开关三次翻车）；
+ * 设置加载 normalizeSettings 逐字段类型校验（根治旧格式穿透）；下载链路沿用已验证设计。 */
 'use strict';
 
 const obsidianApi = require('obsidian');
-const { Plugin, Notice, Modal, Setting, PluginSettingTab, requestUrl, normalizePath, Platform } = obsidianApi;
+const { Plugin, Notice, Setting, PluginSettingTab, requestUrl, normalizePath, Platform } = obsidianApi;
 
-// isomorphic-git bundle（v1.44.2 + LightningFS 4.10.3）
-// 源码形态：静态 require 上级目录的 isogit.bundle.js（esbuild 相对 src/ 解析；Node e2e 沙盒可 mock）；
-// 发版形态：build.sh 经 esbuild --bundle 将其内联进 main.js，零 require 依赖（桌面/移动端通吃）
+// isomorphic-git bundle（v1.44.2 + LightningFS）：源码形态静态 require（Node e2e 可 mock），
+// 发版经 build.sh 内联进 main.js——移动端 Capacitor 对 require 相对路径不可靠，内联是唯一可靠形态
 let isogit = null;
-try { isogit = require('../isogit.bundle.js'); } catch (e) {
-  console.warn('[xu-git-pull] isogit.bundle.js 加载失败（未打包环境属预期）：', (e && e.message) || e);
+try { isogit = require('./isogit.bundle.js'); } catch (e) {
+  console.warn('[xu-git-pull] isogit.bundle.js 加载失败（未打包环境属预期）:', (e && e.message) || e);
 }
 
 const PLUGIN_ID = 'xu-git-pull';
 const REPO_URL = 'https://github.com/xcloud-ai/xu-git-pull';
-// 整仓克隆超时：手机慢网拉大包可能要几分钟，放宽到 5 分钟（可随时取消）
-const CLONE_TIMEOUT_MS = 300000;
-// 各平台 git smart HTTP 基址（与 REST API 是两套服务，配额独立——实测 GitCode 连发克隆零限流）
-const GIT_BASES = { github: 'https://github.com', gitcode: 'https://gitcode.com', gitee: 'https://gitee.com' };
-// LightningFS（IndexedDB）内的克隆工作目录与库名
+const CLONE_TIMEOUT_MS = 300000; // 整仓克隆超时：手机慢网拉大包可能要几分钟
 const CLONE_FS_DB = 'xu-git-pull-fs';
 const CLONE_DIR = '/repo';
-// 内置排除（不可配置、不进用户规则编辑框）：community-plugins.json 是插件启用清单——
-// 覆盖后本插件在手机端会变回未启用（App 重启后"消失"），workspace.json 会用桌面布局覆盖手机工作区。
-// 二者只属于各设备本地状态，同步它们有弊无利（1.8.3）
+// 设备本地状态文件：覆盖会让手机端插件「消失」/工作区错乱，恒排除且不可配置
 const BUILTIN_EXCLUDES = ['community-plugins.json', 'workspace.json'];
-// 下载模式由用户在设置页手动选择（downloadMode 按平台记忆），插件不做自动决策：
-// - 全量覆盖（clone）：git smart HTTP 浅克隆，2 请求拉全仓，内存峰值 ≈ 2×仓库体积——桌面推荐，手机大仓有 OOM 风险（失败时提示切换）
-// - 限速增量（incremental）：tree 清单对比 + 逐文件下载（ratePerMin 限速）+ 断点续传——手机/大仓推荐
 
+const PLATFORMS = [
+  { id: 'gitcode', name: 'GitCode', apiBase: 'https://api.gitcode.com/api/v5', gitBase: 'https://gitcode.com', rpm: 40, tokenDoc: 'https://gitcode.com/docs/zh/docs/auth/token.html', available: true },
+  { id: 'github', name: 'GitHub', apiBase: 'https://api.github.com', gitBase: 'https://github.com', rpm: 60, tokenDoc: 'https://github.com/settings/personal-access-tokens/new', available: true },
+  { id: 'gitee', name: 'Gitee', apiBase: 'https://gitee.com/api/v5', gitBase: 'https://gitee.com', rpm: 50, tokenDoc: 'https://gitee.com/profile/personal_access_tokens', available: true },
+];
+
+// ================================================================
+//  设置：默认值 + 逐字段类型校验（v2 根治：任何旧格式/污染数据在加载时归位）
+// ================================================================
+const DEFAULT_SETTINGS = {
+  language: 'zh',
+  platform: 'gitcode',
+  tokens: { github: '', gitcode: '', gitee: '' },
+  profiles: {
+    github: { repo: '', ref: '', remotePath: '', localPath: '' },
+    gitcode: { repo: '', ref: '', remotePath: '', localPath: '' },
+    gitee: { repo: '', ref: '', remotePath: '', localPath: '' },
+  },
+  downloadMode: { desktop: 'clone', mobile: 'clone' },
+  ratePerMin: { github: 60, gitcode: 40, gitee: 50 },
+  includeObsidian: true,
+  exclude: '',
+};
+
+/** 逐字段校验归位：类型不符（旧格式字符串/数字、缺失、污染）一律用默认值，不深合并不保留坏数据 */
+function normalizeSettings(raw) {
+  const d = DEFAULT_SETTINGS;
+  const out = {};
+  out.language = raw && raw.language === 'en' ? 'en' : 'zh';
+  out.platform = PLATFORMS.some((p) => p.id === (raw && raw.platform)) ? raw.platform : d.platform;
+  out.tokens = { github: '', gitcode: '', gitee: '' };
+  if (raw && raw.tokens && typeof raw.tokens === 'object') {
+    for (const k of Object.keys(out.tokens)) if (typeof raw.tokens[k] === 'string') out.tokens[k] = raw.tokens[k].trim();
+  }
+  out.profiles = {};
+  for (const pf of Object.keys(d.profiles)) {
+    const src = raw && raw.profiles && typeof raw.profiles === 'object' ? raw.profiles[pf] : null;
+    out.profiles[pf] = {};
+    for (const k of ['repo', 'ref', 'remotePath', 'localPath']) {
+      out.profiles[pf][k] = src && typeof src === 'object' && typeof src[k] === 'string' ? src[k] : '';
+    }
+  }
+  out.downloadMode = { desktop: 'clone', mobile: 'clone' };
+  if (raw && raw.downloadMode && typeof raw.downloadMode === 'object') {
+    for (const k of ['desktop', 'mobile']) if (raw.downloadMode[k] === 'incremental') out.downloadMode[k] = 'incremental';
+  } else if (raw && typeof raw.downloadMode === 'string') {
+    // 旧版单字符串格式一次性归位（两端同值）
+    const mode = raw.downloadMode === 'incremental' ? 'incremental' : 'clone';
+    out.downloadMode = { desktop: mode, mobile: mode };
+  }
+  out.ratePerMin = { github: d.ratePerMin.github, gitcode: d.ratePerMin.gitcode, gitee: d.ratePerMin.gitee };
+  if (raw && raw.ratePerMin && typeof raw.ratePerMin === 'object') {
+    for (const k of Object.keys(out.ratePerMin)) {
+      const v = Number(raw.ratePerMin[k]);
+      if (Number.isFinite(v) && v >= 0) out.ratePerMin[k] = Math.floor(v);
+    }
+  } else if (raw && typeof raw.ratePerMin === 'number' && Number.isFinite(raw.ratePerMin) && raw.ratePerMin >= 0) {
+    const v = Math.floor(raw.ratePerMin);
+    out.ratePerMin = { github: v, gitcode: v, gitee: v };
+  }
+  out.includeObsidian = raw && typeof raw.includeObsidian === 'boolean' ? raw.includeObsidian : d.includeObsidian;
+  out.exclude = raw && typeof raw.exclude === 'string' ? raw.exclude : '';
+  return out;
+}
+
+// ================================================================
+//  工具函数
+// ================================================================
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-/** base64 → Uint8Array（git blobs API 返回 base64 内容；atob 在桌面/移动端 WebView 均内置） */
 const b64ToBytes = (b64) => Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
 
-/** isomorphic-git HTTP 适配器工厂：底层换用 Obsidian requestUrl（桌面/手机统一网络栈，绕 CORS）。
- *  认证在适配器层注入 Basic 头（getRemoteInfo 不支持 onAuth 回调，统一在此处理三平台凭据）；
- *  响应体整体到达后包装为单 chunk async iterator（isomorphic-git 接口约定）；
- *  throw:false 让 4xx/5xx 以 statusCode 交给 isomorphic-git 处理（老版本无此参数时从异常里取 response） */
+function trimSlashes(s) {
+  return String(s || '').replace(/^\/+/, '').replace(/\/+$/, '');
+}
+
+/** glob 行编译为正则；匹配 / 分隔的相对路径。
+ * 语义对齐 gitignore：无斜杠模式按 basename 全层级匹配（*.md 命中 a/b/c.md）；
+ * 以 / 结尾的目录规则匹配该目录及其全部后代（tmp/ 命中 tmp、tmp/x.log、tmp/a/b.md） */
+function compileGlob(pattern) {
+  const raw = String(pattern || '').trim();
+  const dirAll = /\/$/.test(raw);
+  const p = trimSlashes(raw);
+  if (!p) return null;
+  let re = '';
+  const parts = p.split('**');
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) re += '.*';
+    re += parts[i]
+      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+      .replace(/\*/g, '[^/]*')
+      .replace(/\?/g, '[^/]');
+  }
+  return new RegExp('^(.*/)?' + re + (dirAll ? '(/.*)?' : '') + '$');
+}
+
+function matchAny(pathRel, matchers) {
+  for (const m of matchers) if (m && m.test(pathRel)) return true;
+  return false;
+}
+
+// ================================================================
+//  i18n（zh 主语言）
+// ================================================================
+const I18N = {
+  zh: {
+    setting_title: 'XU Git Pull（远程资料拉取）',
+    plugin_desc: '从 GitHub/GitCode/Gitee 整仓克隆或限速增量同步仓库文件到笔记库',
+    cmd_pull: '拉取远程仓库文件',
+    ribbon_pull: '拉取远程仓库文件',
+    set_language: '界面语言', set_language_desc: '切换设置页与通知语言',
+    set_platform: '平台', set_platform_desc: '选择远程仓库托管平台',
+    set_token: '访问令牌（Token）', set_token_desc: '私有库必填；公开库可不填。仅存本机，不上传',
+    set_token_doc: '创建 Token', set_token_copied: '令牌创建页链接已复制，请在浏览器打开',
+    set_repo: '仓库', set_repo_desc: '格式 owner/repo，支持嵌套命名空间',
+    set_repo_placeholder: 'owner/repo',
+    set_ref: '分支', set_ref_desc: '留空 = 跟随默认分支最新',
+    set_ref_default: '默认分支（最新）',
+    set_remote_path: '仓库子目录', set_remote_path_desc: '只拉取该子目录；「/」表示整个仓库',
+    set_remote_root: '/（整个仓库）',
+    set_local_path: '本地目标目录', set_local_path_desc: '下载到库中的位置，留空表示库根目录',
+    set_mode: '下载模式', set_mode_desc: '全量覆盖=速度最快；限速增量=只下变更、内存占用极小、断点续传',
+    set_mode_clone: '全量覆盖（整仓克隆，桌面推荐）',
+    set_mode_incr: '限速增量（逐文件下载，手机/大仓推荐）',
+    set_rpm: '每分钟请求数', set_rpm_desc: '限速增量的下载节奏；0 = 全速（易触发平台限流）',
+    set_obsidian: '下载 .obsidian 配置目录', set_obsidian_desc: '开启后插件与外观配置跟随仓库同步；不希望覆盖本机配置时手动关闭',
+    set_exclude: '额外排除规则（每行一个 glob）', set_exclude_desc: '已内置排除 .git/、.trash/、community-plugins.json、workspace.json；** 跨级、* 单级、tmp/ 匹配整个目录',
+    set_pull: '立即拉取', set_pull_desc: '按当前配置从远程同步到本地',
+    set_docs: '使用文档',
+    pull_btn: '立即拉取',
+    loading: '加载中…', refresh: '刷新',
+    notice_pull_busy: '拉取进行中，请等待本次完成',
+    notice_isogit_missing: '克隆组件缺失，请重新安装插件',
+    notice_no_repo: '请先在设置中填写仓库（owner/repo）',
+    notice_repo_invalid: '仓库格式不正确，应为 owner/repo',
+    notice_platform_unsupported: '平台不可用：{name}',
+    notice_unauthorized: 'Token 无效或权限不足（401），请检查设置中的令牌',
+    notice_repo_not_found: '仓库不存在或无权访问（404），请检查仓库名与 Token 权限',
+    notice_rate_limited: 'API 限流中，请稍后重试',
+    notice_ref_not_found: '分支不存在：{ref}',
+    notice_aborted_simple: '已取消',
+    notice_token_doc_copy: 'Token 创建页链接已复制',
+    clone_checking: '正在验证远程仓库…',
+    clone_verified: '验证通过：{repo}（{ref}），开始整仓克隆…',
+    clone_progress: '克隆中… {s}s',
+    write_progress: '写入 {i}/{n}',
+    clone_ok: '拉取完成：写入 {n} 个文件（跳过未变 {s} 个·过滤 {m} 个）· 验证 {v}s + 下载 {c}s + 写盘 {w}s',
+    clone_fail: '克隆失败：{reason}',
+    clone_fail_mobile_hint: '手机端内存不足可能导致克隆失败，建议切换到「限速增量」模式',
+    err_download_timeout: '下载超时：网络无响应',
+    incremental_hint: '限速增量同步：{rpm} 个/分钟，只下载有变更的文件',
+    incr_tree: '正在获取远程文件清单…',
+    incr_start: '增量下载 {n}/{total}',
+    incr_wait: '触发限流，等待 {s}s 后重试…',
+    incr_none: '增量同步：无变更（{total} 个文件均为最新）',
+    incr_done: '增量同步完成：更新 {n} 个、清理远程已删除 {d} 个（{m} 个无变更跳过），耗时 {s}s',
+    incr_truncated: '远程文件清单不完整（超过 2 万条），已中止以防误删，请缩小子目录范围',
+    incr_skipped: '已跳过 {n} 个超大文件（>20MB）：{list}',
+    ref_default: '默认分支',
+    statusbar_cancel_hint: '点击取消拉取',
+  },
+  en: {
+    setting_title: 'XU Git Pull',
+    plugin_desc: 'Clone or incrementally sync repository files from GitHub/GitCode/Gitee into your vault',
+    cmd_pull: 'Pull remote repository files',
+    ribbon_pull: 'Pull remote repository files',
+    set_language: 'Language', set_language_desc: 'Switch settings page and notice language',
+    set_platform: 'Platform', set_platform_desc: 'Choose the remote hosting platform',
+    set_token: 'Access Token', set_token_desc: 'Required for private repos; optional for public ones. Stored locally only',
+    set_token_doc: 'Create Token', set_token_copied: 'Token creation link copied, open it in your browser',
+    set_repo: 'Repository', set_repo_desc: 'Format owner/repo, nested namespaces supported',
+    set_repo_placeholder: 'owner/repo',
+    set_ref: 'Branch', set_ref_desc: 'Empty = follow the default branch',
+    set_ref_default: 'Default branch (latest)',
+    set_remote_path: 'Repository subfolder', set_remote_path_desc: 'Only pull this subfolder; "/" means the whole repo',
+    set_remote_root: '/ (whole repo)',
+    set_local_path: 'Local target folder', set_local_path_desc: 'Where files land in the vault; empty = vault root',
+    set_mode: 'Download mode', set_mode_desc: 'Full clone = fastest; Rate-limited incremental = only changes, tiny memory, resumable',
+    set_mode_clone: 'Full clone (desktop recommended)',
+    set_mode_incr: 'Rate-limited incremental (mobile/large repos)',
+    set_rpm: 'Requests per minute', set_rpm_desc: 'Pace of incremental downloads; 0 = full speed (may trigger rate limits)',
+    set_obsidian: 'Sync .obsidian config folder', set_obsidian_desc: 'Sync plugin and appearance config from the repo; turn off to protect local settings',
+    set_exclude: 'Extra exclude rules (one glob per line)', set_exclude_desc: '.git/, .trash/, community-plugins.json, workspace.json always excluded; ** spans levels, * single level, tmp/ matches a whole folder',
+    set_pull: 'Pull now', set_pull_desc: 'Sync from remote with current settings',
+    set_docs: 'Documentation',
+    pull_btn: 'Pull now',
+    loading: 'Loading…', refresh: 'Refresh',
+    notice_pull_busy: 'A pull is already in progress',
+    notice_isogit_missing: 'Clone component missing, please reinstall the plugin',
+    notice_no_repo: 'Please set a repository (owner/repo) in settings first',
+    notice_repo_invalid: 'Invalid repository format, expected owner/repo',
+    notice_platform_unsupported: 'Platform unavailable: {name}',
+    notice_unauthorized: 'Token invalid or insufficient (401), check the token in settings',
+    notice_repo_not_found: 'Repository not found or no access (404), check repo name and token scope',
+    notice_rate_limited: 'Rate limited, please retry later',
+    notice_ref_not_found: 'Branch not found: {ref}',
+    notice_aborted_simple: 'Cancelled',
+    notice_token_doc_copy: 'Token creation link copied',
+    clone_checking: 'Verifying remote repository…',
+    clone_verified: 'Verified: {repo} ({ref}), cloning…',
+    clone_progress: 'Cloning… {s}s',
+    write_progress: 'Writing {i}/{n}',
+    clone_ok: 'Done: wrote {n} files (skipped {s} unchanged, filtered {m}) · verify {v}s + download {c}s + write {w}s',
+    clone_fail: 'Clone failed: {reason}',
+    clone_fail_mobile_hint: 'Mobile memory may be insufficient for cloning; switch to rate-limited incremental mode',
+    err_download_timeout: 'Download timed out: no network response',
+    incremental_hint: 'Incremental sync: {rpm} files/min, only changed files are downloaded',
+    incr_tree: 'Fetching remote file list…',
+    incr_start: 'Incremental {n}/{total}',
+    incr_wait: 'Rate limited, retrying in {s}s…',
+    incr_none: 'Incremental: no changes ({total} files up to date)',
+    incr_done: 'Incremental done: {n} updated, {d} remote-deleted cleaned ({m} unchanged skipped), {s}s',
+    incr_truncated: 'Remote file list incomplete (>20k entries), aborted to prevent mis-deletion; narrow the subfolder',
+    incr_skipped: 'Skipped {n} oversized files (>20MB): {list}',
+    ref_default: 'default branch',
+    statusbar_cancel_hint: 'Click to cancel',
+  },
+};
+
+// ================================================================
+//  git smart HTTP 适配器（clone/ls-remote 共用，认证在此注入）
+// ================================================================
 const createGitHttp = (plugin) => ({
   async request({ url, method, headers, body }) {
     const h = Object.assign({}, headers || {});
@@ -60,9 +265,7 @@ const createGitHttp = (plugin) => ({
     let res;
     try {
       res = await requestUrl({
-        url,
-        method: method || 'GET',
-        headers: h,
+        url, method: method || 'GET', headers: h,
         body: payload ? payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength) : undefined,
         throw: false,
       });
@@ -84,373 +287,107 @@ const createGitHttp = (plugin) => ({
 });
 
 // ================================================================
-//  i18n
-// ================================================================
-const I18N = {
-  zh: {
-    cmd_pull: '拉取远程文件（整仓覆盖）',
-    ribbon_pull: '拉取远程文件',
-    notice_no_repo: '请先在设置中填写仓库（owner/repo）',
-    notice_repo_invalid: '仓库格式不正确，应为 owner/repo',
-    err_download_timeout: '下载超时：网络无响应',
-    clone_checking: '正在验证远程仓库…',
-    clone_verified: '验证通过：{repo}（{ref}），开始整仓克隆…',
-    clone_progress: '克隆中… {s}s',
-    write_progress: '写入 {i}/{n}',
-    clone_ok: '拉取完成：写入 {n} 个文件（跳过未变 {s} 个·过滤 {m} 个）· 验证 {v}s + 下载 {c}s + 写盘 {w}s',
-    clone_fail: '克隆失败：{reason}',
-    notice_ref_not_found: '分支不存在：{ref}',
-    notice_aborted_simple: '已取消',
-    notice_pull_busy: '拉取进行中，请等待本次完成',
-    notice_isogit_missing: '克隆组件（isogit.bundle.js）缺失，请重新安装插件',
-    notice_unauthorized: 'Token 无效或权限不足（401），请检查设置中的令牌',
-    notice_repo_not_found: '仓库不存在或无权访问（404），请检查仓库名与 Token 权限',
-    notice_rate_limited: 'API 限流中，请稍后重试',
-    notice_cancelling: '取消中…（克隆完成后跳过写入）',
-    statusbar_cancel_hint: '点击取消拉取',
-    incremental_hint: '限速增量同步：{rpm} 个/分钟，只下载有变更的文件，支持断点续传',
-    mode_title: '下载模式',
-    mode_full: '全量覆盖',
-    mode_full_desc: '整仓克隆后覆盖写入，速度最快（大库十几秒）；内存占用约仓库体积 2 倍，桌面端推荐',
-    mode_incr: '限速增量',
-    mode_incr_desc: '逐个下载有变更的文件，内存占用极小；限速防平台限流，支持断点续传；手机/大仓推荐',
-    setting_rate: '每分钟请求数',
-    btn_help: '帮助',
-    help_title: '下载模式说明',
-    help_clone: '全量覆盖（默认）\n· 整仓克隆，约 2 个网络请求，速度最快\n· 内存占用约为仓库体积的 2 倍\n· 桌面端推荐；手机端大仓库（如上百 MB）可能内存不足闪退\n· 覆盖写入远端有变化的文件，本地一致的跳过；不删除任何本地文件',
-    help_incr: '限速增量\n· 只下载有变更的文件，内存占用极小\n· 首次使用（无底账）：逐文件全量下载并建账，之后每次只拉变更\n· 按每分钟 N 个文件限速，避免触发平台限流\n· 支持断点续传：中断后下次接着传\n· 远程已删除的文件会同步清理',
-    help_rate: '限速建议值\n· GitCode：40/分（实测约 50/分触发限流，留余量）\n· GitHub：60/分\n· Gitee：50/分\n· 0 = 全速（不推荐，大仓易触发 429 限流）',
-    help_cancel: '拉取过程中可点击状态栏 ⬇ 取消；限速增量的进度已保存，下次自动续传',
-    clone_fail_mobile_hint: '手机端克隆失败多为内存不足，建议在设置中切换为「限速增量」模式',
-    incr_tree: '增量同步：获取远程文件清单…',
-    incr_truncated: '远程文件清单不完整（仓库过大），增量同步中止，请改用桌面端',
-    incr_start: '增量同步：{n}/{total} 个文件有变更',
-    incr_none: '增量同步：无变更（{total} 个文件均为最新）',
-    incr_wait: '触发平台限流，等待 {s}s 后自动继续…',
-    incr_done: '增量同步完成：更新 {n} 个、清理远程已删除 {d} 个（{m} 个无变更跳过），耗时 {s}s',
-    incr_skipped: '已跳过 {n} 个超大文件（>20MB，移动端内存限制）：{list}',
-    setting_title: 'XU Git Pull（远程资料拉取）',
-    setting_header_desc: '从远程仓库（支持私有库）单向拉取文件到本 vault：全量克隆覆盖更新，或增量同步只拉变更（远程已删除文件在增量模式下同步清理），适合手机/平板只看资料的场景。',
-    setting_language: '界面语言',
-    lang_zh: '中文',
-    lang_en: 'English',
-    sec_repo: '仓库',
-    setting_platform: '代码托管平台',
-    setting_platform_desc: '选择远程仓库所在平台。当前版本已支持 GitHub、GitCode 与 Gitee，其他平台后续按需添加。',
-    notice_platform_unsupported: '「{name}」平台将在后续版本支持，当前版本请先选择 GitHub',
-    grp_domestic: '🇨🇳 国内',
-    grp_overseas: '🌍 国外',
-    pn_github: 'GitHub',
-    pn_gitcode: 'GitCode',
-    pn_gitee: 'Gitee（码云）',
-    setting_repo: '仓库地址',
-    setting_repo_desc: '填写 Token 后此处自动列出可访问的仓库，直接选择即可；未填 Token 时手动输入 owner/repo（仅公开库）',
-    setting_ref: '分支',
-    setting_ref_desc: '选择远程分支，默认拉取该分支的最新内容',
-    ref_default: '默认分支（最新）',
-    ref_select_first: '请先选择仓库',
-    setting_remote_path: '仓库内子目录',
-    setting_remote_path_desc: '自动列出仓库内文件夹，选择后只拉取该目录；选「/」表示整个仓库',
-    folder_root: '/（整个仓库）',
-    folder_select_first: '请先选择分支',
-    setting_local_path: '本地目标目录',
-    setting_local_path_desc: '下载到 vault 中的位置，留空表示 vault 根目录',
-    sec_filter: '过滤',
-    setting_include_obsidian: '下载 .obsidian 配置目录',
-    setting_include_obsidian_desc: '默认开启（同步 .obsidian/ 配置目录，插件与外观配置跟随仓库）。不希望覆盖本机配置时手动关闭。',
-    setting_exclude: '额外排除规则（每行一条 glob）',
-    setting_exclude_desc: '已内置排除 .git/、.trash/、community-plugins.json、workspace.json（设备本地状态，同步有弊无利）；此处可追加，** 匹配任意层级目录，* 匹配单层名称',
-    action_pull: '立即拉取',
-    action_pull_desc: '验证远程仓库后整仓克隆并覆盖更新',
-    setting_token: '{name} Token',
-    setting_token_desc: '私有库必填，公开库可不填。填写后下方仓库、分支、子目录自动加载为下拉选择，无需手填。各平台令牌独立保存在本设备 data.json 中，切换平台互不影响。建议使用只读权限的最小授权令牌。',
-    ph_github: 'github_pat_…',
-    ph_gitcode: 'GitCode 个人访问令牌',
-    ph_gitee: 'Gitee 私人令牌',
-    notice_link_copied: '链接已复制，可发送到电脑打开',
-    btn_token_docs: '如何创建 Token？',
-    btn_token_create: '直接创建',
-    list_loading: '列表加载中…',
-    list_failed: '加载失败，点右侧刷新重试',
-    btn_refresh: '刷新列表',
-    setting_docs: '使用文档',
-    btn_github: 'GitHub',
-  },
-  en: {
-    cmd_pull: 'Pull remote files (full clone overwrite)',
-    ribbon_pull: 'Pull remote files',
-    notice_no_repo: 'Set a repository (owner/repo) in settings first',
-    notice_repo_invalid: 'Invalid repository format, expected owner/repo',
-    err_download_timeout: 'Download timed out: no response',
-    clone_checking: 'Verifying remote repository…',
-    clone_verified: 'Verified: {repo} ({ref}). Cloning…',
-    clone_progress: 'Cloning… {s}s',
-    write_progress: 'Writing {i}/{n}',
-    clone_ok: 'Done: {n} written ({s} unchanged skipped, {m} filtered) — verify {v}s + download {c}s + write {w}s',
-    clone_fail: 'Clone failed: {reason}',
-    notice_ref_not_found: 'Branch not found: {ref}',
-    notice_aborted_simple: 'Cancelled',
-    notice_pull_busy: 'Pull already in progress — please wait',
-    notice_isogit_missing: 'Clone component (isogit.bundle.js) missing — reinstall the plugin',
-    notice_unauthorized: 'Token invalid or unauthorized (401) — check the token in settings',
-    notice_repo_not_found: 'Repository not found or access denied (404) — check the repo name and token permissions',
-    notice_rate_limited: 'API rate limited — please retry later',
-    notice_cancelling: 'Cancelling… (writing will be skipped)',
-    statusbar_cancel_hint: 'Click to cancel the pull',
-    incremental_hint: 'Incremental sync: {rpm} files/min, only changed files are downloaded, with resume support.',
-    mode_title: 'Download mode',
-    mode_full: 'Full clone',
-    mode_full_desc: 'Clone whole repo then overwrite — fastest (a large repo in seconds); uses ~2x repo size in memory. Recommended on desktop.',
-    mode_incr: 'Throttled incremental',
-    mode_incr_desc: 'Download only changed files one by one — tiny memory footprint; throttled to avoid platform rate limits, with resume support. Recommended on phones / large repos.',
-    setting_rate: 'Requests per minute',
-    btn_help: 'Help',
-    help_title: 'Download modes explained',
-    help_clone: 'Full clone (default)\n- Clone the whole repo in ~2 requests — fastest\n- Uses ~2x repo size in memory\n- Recommended on desktop; large repos (100MB+) may crash mobile apps\n- Overwrites files changed on the remote; locally unchanged files are hash-checked and skipped; nothing is deleted locally',
-    help_incr: 'Throttled incremental\n- Downloads only changed files, tiny memory footprint\n- First run (no ledger): all files downloaded one by one to build the ledger; later runs fetch changes only\n- Throttled to N files/min to avoid platform rate limits\n- Resume support: interrupted downloads continue next time\n- Remotely deleted files are cleaned up locally',
-    help_rate: 'Suggested throttle values\n- GitCode: 40/min (~50/min triggers rate limit, keep margin)\n- GitHub: 60/min\n- Gitee: 50/min\n- 0 = full speed (not recommended; large repos will hit 429)',
-    help_cancel: 'Tap the ⬇ status-bar item to cancel mid-pull; incremental progress is saved and resumes automatically',
-    clone_fail_mobile_hint: 'Clone failures on phones are usually out-of-memory. Consider switching to "Throttled incremental" in settings.',
-    incr_tree: 'Incremental sync: fetching remote file list…',
-    incr_truncated: 'Remote file list incomplete (repo too large) — incremental sync aborted. Use desktop instead.',
-    incr_start: 'Incremental sync: {n}/{total} files changed',
-    incr_none: 'Incremental sync: nothing changed ({total} files up to date)',
-    incr_wait: 'Rate limited — retrying in {s}s…',
-    incr_done: 'Incremental sync done: {n} updated, {d} remote-deleted removed ({m} unchanged), took {s}s',
-    incr_skipped: 'Skipped {n} oversized file(s) (>20MB, mobile memory limit): {list}',
-    setting_title: 'XU Git Pull',
-    setting_header_desc: 'One-way pull from a remote repo (private supported) into this vault: full clone or incremental sync chosen automatically by repo size (with remote-deletion cleanup) — ideal for read-only phones/tablets.',
-    setting_language: 'UI language',
-    lang_zh: '中文',
-    lang_en: 'English',
-    sec_repo: 'Repository',
-    setting_platform: 'Hosting platform',
-    setting_platform_desc: 'Where the remote repository is hosted. GitHub, GitCode and Gitee are supported now; more platforms will be added as needed.',
-    notice_platform_unsupported: '{name} support is coming soon. Please choose GitHub in this version.',
-    grp_domestic: '🇨🇳 China',
-    grp_overseas: '🌍 Overseas',
-    pn_github: 'GitHub',
-    pn_gitcode: 'GitCode',
-    pn_gitee: 'Gitee',
-    setting_repo: 'Repository',
-    setting_repo_desc: 'With a token set, accessible repositories are listed here for picking; without a token, type owner/repo manually (public repos only)',
-    setting_ref: 'Branch',
-    setting_ref_desc: 'Pick a remote branch; the latest commit on it is pulled',
-    ref_default: 'Default branch (latest)',
-    ref_select_first: 'Pick a repository first',
-    setting_remote_path: 'Remote subfolder',
-    setting_remote_path_desc: 'Repository folders are listed automatically; pick one to pull only that folder, or "/" for the whole repo',
-    folder_root: '/ (whole repository)',
-    folder_select_first: 'Pick a branch first',
-    setting_local_path: 'Local destination folder',
-    setting_local_path_desc: 'Where to download inside the vault; empty = vault root',
-    sec_filter: 'Filtering',
-    setting_include_obsidian: 'Download the .obsidian config folder',
-    setting_include_obsidian_desc: 'On by default (syncs .obsidian/ so plugins and appearance follow the repo). Turn off to keep local config.',
-    setting_exclude: 'Extra exclude patterns (one glob per line)',
-    setting_exclude_desc: 'Built-in: .git/, .trash/, community-plugins.json, workspace.json (device-local state — never sync these). Add more here. ** matches any depth, * a single segment.',
-    action_pull: 'Pull now',
-    action_pull_desc: 'Verify the remote repo, then clone and overwrite',
-    setting_token: '{name} token',
-    setting_token_desc: 'Required for private repos, optional for public. Once set, repository, branch and subfolder become dropdowns — no typing. Tokens are stored per platform in local data.json; switching platforms never mixes them. A minimal read-only token is recommended.',
-    ph_github: 'github_pat_…',
-    ph_gitcode: 'GitCode personal access token',
-    ph_gitee: 'Gitee personal access token',
-    notice_link_copied: 'Link copied — paste it on your computer',
-    btn_token_docs: 'How to create a token?',
-    btn_token_create: 'Create one',
-    list_loading: 'Loading list…',
-    list_failed: 'Load failed, click refresh to retry',
-    btn_refresh: 'Refresh list',
-    setting_docs: 'Documentation',
-    btn_github: 'GitHub',
-  },
-};
-
-// 平台清单：国内在前（GitCode/Gitee），国外在后（GitHub）；均可用
-// 三平台 API 同构（Gitee v5 兼容风格），仅 base URL 不同；tokenCreate/tokenDoc 跟随平台
-const PLATFORMS = [
-  {
-    id: 'gitcode', group: 'domestic', available: true,
-    apiBase: 'https://api.gitcode.com/api/v5',
-    // 令牌创建页：设置 → 安全设置 → 私人令牌（classic）
-    tokenCreate: 'https://gitcode.com/setting/token-classic/create',
-    tokenDoc: { zh: 'https://docs.gitcode.com/en/docs/oauth/', en: 'https://docs.gitcode.com/en/docs/oauth/' },
-  },
-  {
-    id: 'gitee', group: 'domestic', available: true,
-    apiBase: 'https://gitee.com/api/v5',
-    // 令牌创建页：设置 → 安全设置 → 私人令牌
-    tokenCreate: 'https://gitee.com/profile/personal_access_tokens',
-    tokenDoc: { zh: 'https://gitee.com/api/v5/swagger', en: 'https://gitee.com/api/v5/swagger' },
-  },
-  {
-    id: 'github', group: 'overseas', available: true,
-    apiBase: 'https://api.github.com',
-    tokenCreate: 'https://github.com/settings/personal-access-tokens/new',
-    tokenDoc: {
-      zh: 'https://docs.github.com/zh/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens',
-      en: 'https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens',
-    },
-  },
-];
-
-// 仓库链路字段：按平台隔离（切换平台整组换装），过滤项保持全局
-const PROFILE_KEYS = ['repo', 'ref', 'remotePath', 'localPath'];
-
-function defaultProfile() {
-  const p = {};
-  for (const k of PROFILE_KEYS) p[k] = '';
-  return p;
-}
-
-const DEFAULT_SETTINGS = {
-  language: 'zh',
-  platform: 'github',
-  // 仓库链路「活跃字段」：声明式控件直接读写顶层，切换平台时整组换装（快照存 profiles）
-  repo: '',
-  ref: '',
-  remotePath: '',
-  localPath: '',
-  includeObsidian: true,
-  exclude: '',
-  tokens: { github: '', gitcode: '', gitee: '' },
-  profiles: { github: defaultProfile(), gitcode: defaultProfile(), gitee: defaultProfile() },
-  // 下载模式：'clone'（全量覆盖，默认）| 'incremental'（限速增量）。按平台记忆——
-  // data.json 随 .obsidian/ 在多端同步，桌面/手机各自选择互不干扰
-  downloadMode: { desktop: 'clone', mobile: 'clone' },
-  // 限速增量模式的每分钟请求数（按 git 平台预填建议值，用户可改；0 = 全速不推荐）
-  // 建议依据：GitCode 实测约 50 文件/分触发 429 限流，40 留余量
-  ratePerMin: { gitcode: 40, github: 60, gitee: 50 },
-};
-
-// ================================================================
-//  工具函数
-// ================================================================
-
-function trimSlashes(s) {
-  return String(s || '').replace(/^\/+/, '').replace(/\/+$/, '');
-}
-
-/** glob 行规则编译为正则；匹配以 / 分隔的相对路径 */
-function compileGlob(pattern) {
-  const p = trimSlashes(pattern);
-  if (!p) return null;
-  let re = '';
-  const parts = p.split('**');
-  for (let i = 0; i < parts.length; i++) {
-    if (i > 0) re += '.*';
-    re += parts[i]
-      .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-      .replace(/\*/g, '[^/]*')
-      .replace(/\?/g, '[^/]');
-  }
-  return new RegExp('^(.*/)?' + re + '$');
-}
-
-function matchAny(pathRel, matchers) {
-  for (const m of matchers) {
-    if (m && m.test(pathRel)) return true;
-  }
-  return false;
-}
-
-// ================================================================
-//  插件主体
+//  主插件
 // ================================================================
 class GitPullPlugin extends Plugin {
-  t(key, params) {
-    const dict = I18N[this.settings.language] || I18N.zh;
-    let text = dict[key] || key;
-    if (params) {
-      for (const k of Object.keys(params)) {
-        text = text.replace(new RegExp('\\{' + k + '\\}', 'g'), params[k]);
-      }
-    }
-    return text;
+  async onload() {
+    this.settings = normalizeSettings(await this.loadData());
+    this._listCache = {};
+    this._pullBusy = false;
+    this._cancelAll = false;
+    this._activeAbort = null;
+
+    this.addRibbonIcon('download-cloud', this.t('ribbon_pull'), () => this.pull());
+    this.addCommand({ id: 'pull', name: this.t('cmd_pull'), callback: () => this.pull() });
+    this._statusEl = this.addStatusBarItem();
+    if (this._statusEl && this._statusEl.addClass) this._statusEl.addClass('xgp-status');
+    this.registerDomEvent(this._statusEl, 'click', () => { if (this._activeAbort) this._activeAbort(); });
+    this.addSettingTab(new GitPullSettingTab(this.app, this));
   }
 
-  async onload() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, (await this.loadData()) || {});
-    // tokens / profiles 浅合并（旧配置可能缺 gitcode 键），profile 逐键补默认
-    this.settings.tokens = Object.assign({}, DEFAULT_SETTINGS.tokens, this.settings.tokens || {});
-    this.settings.profiles = Object.assign({}, DEFAULT_SETTINGS.profiles, this.settings.profiles || {});
-    for (const pf of Object.keys(this.settings.profiles)) {
-      this.settings.profiles[pf] = Object.assign(defaultProfile(), this.settings.profiles[pf] || {});
-    }
-    // 旧版格式迁移：<1.8.2 的 downloadMode 是单字符串、<1.8.5 的 ratePerMin 是单数字。
-    // 浅合并会原样保留旧格式——字符串上取键恒为 undefined，pull() 永远落回全量克隆，
-    // 设置页开关在字符串上赋属性抛 TypeError、保存链路断裂（持久化失效）。一次性迁为对象并落盘。
-    let legacyFmt = false;
-    if (typeof this.settings.downloadMode === 'string') {
-      const legacyMode = this.settings.downloadMode === 'incremental' ? 'incremental' : 'clone';
-      this.settings.downloadMode = { desktop: legacyMode, mobile: legacyMode };
-      legacyFmt = true;
-    } else if (!this.settings.downloadMode || typeof this.settings.downloadMode !== 'object') {
-      this.settings.downloadMode = Object.assign({}, DEFAULT_SETTINGS.downloadMode);
-    }
-    if (typeof this.settings.ratePerMin === 'number') {
-      this.settings.ratePerMin = { github: this.settings.ratePerMin, gitcode: this.settings.ratePerMin, gitee: this.settings.ratePerMin };
-      legacyFmt = true;
-    } else if (!this.settings.ratePerMin || typeof this.settings.ratePerMin !== 'object') {
-      this.settings.ratePerMin = Object.assign({}, DEFAULT_SETTINGS.ratePerMin);
-    }
-    if (legacyFmt) void this.saveSettings();
-    // 旧版单 token 字段迁移（历史配置只可能是 GitHub Token）
-    if (this.settings.token) {
-      if (!this.settings.tokens.github) this.settings.tokens.github = String(this.settings.token).trim();
-      delete this.settings.token;
-      void this.saveSettings();
-    }
-    // 旧版平铺仓库链路字段迁移为 GitHub 档案（活跃顶层字段保留）
-    if (this.settings.repo !== undefined && !this.settings.profiles.github.repo) {
-      const g = this.settings.profiles.github;
-      g.repo = this.settings.repo || '';
-      g.ref = this.settings.ref || '';
-      g.remotePath = this.settings.remotePath || '';
-      g.localPath = this.settings.localPath || '';
-      void this.saveSettings();
-    }
-    this.addSettingTab(new GitPullSettingTab(this.app, this));
+  onunload() {
+    // register* 系资源自动清理；状态栏元素随插件卸载自动移除
+  }
 
-    this.addRibbonIcon('download', this.t('ribbon_pull'), () => { void this.pull(); });
-
-    // 状态栏兜底入口：后台下载时显示进度，通知被误关后仍可从状态栏取消
-    this._statusEl = this.addStatusBarItem();
-    this.registerDomEvent(this._statusEl, 'click', () => {
-      if (this._activeAbort) this._activeAbort();
-    });
-
-    this.addCommand({
-      id: 'pull-latest',
-      name: this.t('cmd_pull'),
-      callback: () => { void this.pull(); },
-    });
-
-    console.log('[' + PLUGIN_ID + '] loaded');
+  t(key, vars) {
+    const pack = I18N[this.settings.language] || I18N.zh;
+    let s = pack[key] != null ? pack[key] : (I18N.zh[key] || key);
+    if (vars) for (const k of Object.keys(vars)) s = s.split('{' + k + '}').join(String(vars[k]));
+    return s;
   }
 
   async saveSettings() {
-    await this.saveData(this.settings);
+    await this.saveData(JSON.parse(JSON.stringify(this.settings)));
   }
 
-  /** 当前平台的 API 基址（三平台端点同构，仅基址不同） */
-  apiBase() {
-    const pf = PLATFORMS.find((x) => x.id === (this.settings.platform || 'github')) || PLATFORMS.find((x) => x.available);
-    return pf.apiBase;
+  /** 当前平台的令牌 */
+  token() {
+    const t = this.settings.tokens || {};
+    return String(t[this.settings.platform] || '').trim();
   }
 
-  /** GitCode 的 tree API 会分页（默认 20 条/页，且目录排在文件前）；GitHub/Gitee 单次返回全量 */
-  paginatesTree() {
-    return (this.settings.platform || 'github') === 'gitcode';
+  platformCfg() {
+    return PLATFORMS.find((p) => p.id === this.settings.platform) || PLATFORMS[0];
   }
 
-  /** 取完整文件树：统一入口。GitCode 分页页与页之间并行预取（每批 5 页），大幅缩短大仓库等待 */
+  apiBase() { return this.platformCfg().apiBase; }
+
+  headers() {
+    const h = {};
+    if ((this.settings.platform || 'github') === 'github') {
+      h.Accept = 'application/vnd.github+json';
+      h['X-GitHub-Api-Version'] = '2022-11-28';
+    }
+    const token = this.token();
+    if (token) h.Authorization = 'Bearer ' + token;
+    return h;
+  }
+
+  /** 解析并校验设置 → 下载配置（错误以 error 返回） */
+  resolveConfig() {
+    const repoRaw = trimSlashes(this.settings.profiles[this.settings.platform].repo);
+    if (!repoRaw) return { error: this.t('notice_no_repo') };
+    const m = repoRaw.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_./-]+?)(?:\.git)?$/);
+    if (!m) return { error: this.t('notice_repo_invalid') };
+    const pf = this.settings.profiles[this.settings.platform];
+    const patterns = ['.git/**', '.trash/**'].concat(BUILTIN_EXCLUDES);
+    if (!this.settings.includeObsidian) patterns.push('.obsidian/**');
+    const matchers = patterns
+      .concat(String(this.settings.exclude || '').split('\n').map((s) => s.trim()))
+      .map(compileGlob)
+      .filter(Boolean);
+    return {
+      platform: this.settings.platform,
+      owner: m[1],
+      repo: m[2],
+      ref: trimSlashes(pf.ref),
+      remotePath: trimSlashes(pf.remotePath),
+      localPath: trimSlashes(pf.localPath),
+      matchers,
+    };
+  }
+
+  async apiGetJson(url) {
+    let res;
+    try {
+      res = await requestUrl({ url, method: 'GET', headers: this.headers() });
+    } catch (err) {
+      if (err && err.status === 401) throw Object.assign(new Error(this.t('notice_unauthorized')), { code: 'unauthorized' });
+      if (err && (err.status === 404 || err.status === 422)) throw Object.assign(new Error(this.t('notice_repo_not_found')), { code: 'not_found' });
+      if (err && err.status === 403) {
+        const remain = err.response?.headers?.['x-ratelimit-remaining'];
+        if (remain === '0' || remain === 0) throw Object.assign(new Error(this.t('notice_rate_limited')), { code: 'rate_limited' });
+        throw Object.assign(new Error(this.t('notice_unauthorized')), { code: 'unauthorized' });
+      }
+      throw err;
+    }
+    return res.json;
+  }
+
+  /** 全量文件清单：GitHub/Gitee 单请求；GitCode 分页自动翻页取全（短页=最后一页；失败退避重试后中止） */
   async fetchTreeAll(owner, repo, ref) {
     const base = this.apiBase() + '/repos/' + owner + '/' + repo + '/git/trees/' + encodeURIComponent(ref);
-    if (!this.paginatesTree()) {
-      return this.apiGetJson(base + '?recursive=1');
-    }
+    if (!this.paginatesTree()) return this.apiGetJson(base + '?recursive=1');
     const merged = [];
     const fetchPage = async (page) => {
       let lastErr = null;
@@ -458,8 +395,7 @@ class GitPullPlugin extends Plugin {
         try { return await this.apiGetJson(base + '?recursive=1&per_page=100&page=' + page); }
         catch (e) { lastErr = e; await sleep(400 * (t + 1)); }
       }
-      // 翻页失败绝不伪装成「最后一页」——残缺清单会让增量模式把本地文件误判为远端已删
-      throw lastErr;
+      throw lastErr; // 翻页失败绝不伪装成最后一页——残缺清单会让增量误删本地文件
     };
     let page = 1;
     let more = true;
@@ -470,48 +406,34 @@ class GitPullPlugin extends Plugin {
       for (const d of results) {
         const items = Array.isArray(d.tree) ? d.tree : [];
         merged.push(...items);
-        if (items.length < 100) more = false; // 短页=最后一页
+        if (items.length < 100) more = false;
       }
     }
-    // 触顶静默截断同样危险：超出部分不在清单里会被当成已删，如实上报让调用方中止
     return { tree: merged.slice(0, 20000), truncated: merged.length > 20000 };
   }
 
-  /** 当前平台的令牌（按平台独立存储，切换平台互不影响） */
-  token() {
-    const t = this.settings.tokens || {};
-    return String(t[this.settings.platform] || '').trim();
-  }
+  paginatesTree() { return (this.settings.platform || 'github') === 'gitcode'; }
 
-  /** ── 整仓克隆（git smart HTTP）────────────────────────────
-   *  git 服务与 REST API 配额独立，实测连发大仓库克隆零限流；
-   *  isomorphic-git（bundle）+ LightningFS（IndexedDB）+ requestUrl HTTP 适配 */
-
-  /** 平台 git 仓库 URL（https://<gitBase>/<owner>/<repo>.git） */
   gitRemoteUrl(owner, repo) {
-    return (GIT_BASES[this.settings.platform || 'github'] || GIT_BASES.github) + '/' + owner + '/' + repo + '.git';
+    return this.platformCfg().gitBase + '/' + owner + '/' + repo + '.git';
   }
 
-  /** isomorphic-git 认证回调：统一 oauth2:<token> Basic 形式（GitHub/GitCode 官方写法，Gitee 兼容） */
   gitAuth() {
     const token = this.token();
     if (!token) return undefined;
     return () => ({ username: 'oauth2', password: token });
   }
 
-  /** HTTP 适配器实例（clone/ls-remote 共用，认证在适配器内注入） */
   gitHttp() {
     if (!this._gitHttpInst) this._gitHttpInst = createGitHttp(this);
     return this._gitHttpInst;
   }
 
-  /** LightningFS 单例（IndexedDB 库 CLONE_FS_DB） */
   cloneFs() {
     if (!this._cloneFs) this._cloneFs = new isogit.fs(CLONE_FS_DB);
     return this._cloneFs;
   }
 
-  /** LightningFS 递归删除目录（LightningFS 无 rimraf，逐项 unlink/rmdir） */
   async fsRmrf(fsp, p) {
     let entries;
     try { entries = await fsp.promises.readdir(p); } catch (e) { return; }
@@ -528,10 +450,15 @@ class GitPullPlugin extends Plugin {
     }
   }
 
+  async verifyRemote(url) {
+    const info = await isogit.git.getRemoteInfo({ http: this.gitHttp(), url });
+    return { refs: (info && info.refs) || {} };
+  }
+
   /** vault 目录逐级创建（adapter.mkdir 只建单级） */
   async ensureDirFor(localPath) {
     const parts = localPath.split('/').filter(Boolean);
-    parts.pop(); // 最后一段是文件名
+    parts.pop();
     let cur = '';
     for (const seg of parts) {
       cur = cur ? cur + '/' + seg : seg;
@@ -541,20 +468,67 @@ class GitPullPlugin extends Plugin {
     }
   }
 
-  /** ① ls-remote 验证（1 个请求）：仓库可达、Token 有效、分支存在。
-   *  返回 refs 结构化映射（{heads:{分支名:sha}}）；isomorphic-git 不回 HEAD symref，默认分支由 clone 自动跟随 */
-  async verifyRemote(url) {
-    const info = await isogit.git.getRemoteInfo({ http: this.gitHttp(), url });
-    return { refs: (info && info.refs) || {} };
+  /** 增量底账路径：平台-仓库-子目录 slug（切范围互不干扰） */
+  manifestKey(owner, repo) {
+    const rpSlug = (trimSlashes(this.settings.profiles[this.settings.platform].remotePath).replace(/[^a-zA-Z0-9._-]+/g, '-') || 'root');
+    return normalizePath('.xu-git-pull/' + (this.settings.platform || 'github') + '-' + owner + '-' + repo + '-' + rpSlug + '.json');
   }
 
-  /** ②③ 整仓克隆 → 过滤 → 对账跳写 → 差集清理 → 汇总。抛错由调用方决定回退/终止 */
+  async saveManifestSafe(key, obj) {
+    const dir = key.split('/').slice(0, -1).join('/');
+    try {
+      if (dir && !(await this.app.vault.adapter.exists(dir))) await this.app.vault.adapter.mkdir(dir);
+      await this.app.vault.adapter.write(key, JSON.stringify(obj));
+    } catch (e) {
+      console.error('[' + PLUGIN_ID + '] manifest save failed:', e);
+    }
+  }
+
+  // ---------------- 拉取入口 ----------------
+
+  async pull() {
+    const cfg = this.resolveConfig();
+    if (cfg.error) { new Notice(cfg.error, 4000); return; }
+    if (this._pullBusy) { new Notice(this.t('notice_pull_busy'), 3000); return; }
+    this._pullBusy = true;
+    const n1 = new Notice(this.t('clone_checking'), 0);
+    this._cancelAll = false;
+    this._activeAbort = () => { this._cancelAll = true; };
+    if (this._statusEl) {
+      this._statusEl.setAttribute('title', this.t('statusbar_cancel_hint'));
+      this._statusEl.setText('⬇ ' + this.t('clone_checking'));
+    }
+    try {
+      const platKey = Platform.isMobile ? 'mobile' : 'desktop';
+      const dm = (this.settings.downloadMode && this.settings.downloadMode[platKey]) || 'clone';
+      if (dm === 'incremental') {
+        const rpm = (this.settings.ratePerMin && this.settings.ratePerMin[this.settings.platform]) || 40;
+        const msg = this.t('incremental_hint', { rpm });
+        n1.setMessage(msg);
+        new Notice(msg, 4000);
+        await this.pullIncremental(cfg, n1);
+        return;
+      }
+      await this.pullViaClone(cfg, n1);
+    } catch (err) {
+      n1.hide();
+      if (this._cancelAll || (err && err.code === 'aborted')) { new Notice(this.t('notice_aborted_simple'), 4000); return; }
+      if (err && err.code === 'verify') { new Notice(err.message, 6000); return; }
+      console.error('[' + PLUGIN_ID + '] pull failed:', err);
+      if (Platform.isMobile) new Notice(this.t('clone_fail_mobile_hint'), 8000);
+      new Notice(this.t('clone_fail', { reason: String((err && err.message) || err) }), 6000);
+    } finally {
+      this._pullBusy = false;
+      this._activeAbort = null;
+      if (this._statusEl) this._statusEl.setText('');
+    }
+  }
+
+  // ---------------- 全量克隆（depth=1 浅克隆 + 树遍历 + 对账跳写） ----------------
+
   async pullViaClone(cfg, notice) {
     const url = this.gitRemoteUrl(cfg.owner, cfg.repo);
-    let vS = 0; // 验证段耗时；未指定分支时跳过验证 = 0
-
-    // ① 验证：仅「指定分支」时 ls-remote 校验分支存在（1 个请求）；未指定分支时
-    //    clone 会自动跟随远程默认分支，ls-remote 结果用不上——直接跳过省一次往返（1.8.12）
+    let vS = 0;
     if (cfg.ref) {
       notice.setMessage(this.t('clone_checking'));
       const tv = Date.now();
@@ -568,16 +542,14 @@ class GitPullPlugin extends Plugin {
     const refLabel = cfg.ref || this.t('ref_default');
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
 
-    // ② 清理旧克隆 → 浅克隆（5 分钟超时兜底，心跳显示已用时）。
-    //    noCheckout：不写工作区（省一份 IndexedDB 全仓写入），克隆后从提交树逐 blob 读出再过滤写盘
     notice.setMessage(this.t('clone_verified', { repo: cfg.owner + '/' + cfg.repo, ref: refLabel }));
     const fsp = this.cloneFs();
     await this.fsRmrf(fsp, CLONE_DIR);
     const t1 = Date.now();
     const hb = setInterval(() => {
       if (this._cancelAll) {
-        notice.setMessage(this.t('notice_cancelling'));
-        if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('notice_cancelling'));
+        notice.setMessage(this.t('notice_aborted_simple'));
+        if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('notice_aborted_simple'));
         return;
       }
       const s = Math.round((Date.now() - t1) / 1000);
@@ -591,7 +563,6 @@ class GitPullPlugin extends Plugin {
           fs: fsp, http: this.gitHttp(), url, dir: CLONE_DIR,
           depth: 1, singleBranch: true, ref, noCheckout: true,
         }),
-        // 超时兜底：timer 必须清理，否则成功后仍会在 5 分钟时 reject（泄漏 + unhandled rejection）
         new Promise((_, reject) => {
           timeoutId = setTimeout(() => reject(new Error(this.t('err_download_timeout'))), CLONE_TIMEOUT_MS);
         }),
@@ -601,9 +572,6 @@ class GitPullPlugin extends Plugin {
       if (timeoutId) clearTimeout(timeoutId);
     }
 
-    // ③ 遍历提交树（noCheckout 模式无工作区）→ 过滤 → 对账跳写 → 差集清理 → 写 vault（精确进度）
-    //    写盘段包 try/finally：无论成功/失败/取消，结束即删 /repo/.git——
-    //    git 对象（264MB 级）不再常驻 IndexedDB，下次克隆前 fsRmrf 瞬时完成
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
     try {
       const t2 = Date.now();
@@ -616,31 +584,28 @@ class GitPullPlugin extends Plugin {
           const full = prefix ? prefix + '/' + it.path : it.path;
           if (it.type === 'tree') await walkTree(it.oid, full);
           else if (it.type === 'blob') all.push({ path: full, oid: it.oid });
-          // symlink(120000)/gitlink(160000 子模块) 不落盘
         }
       };
       await walkTree(commit.commit.tree, '');
       const prefix = cfg.remotePath ? cfg.remotePath.replace(/\/+$/, '') + '/' : '';
       const targets = all.filter((it) => {
-        if (it.path.split('/').includes('..')) return false; // 防越界
+        if (it.path.split('/').includes('..')) return false;
         const key = prefix ? (it.path.startsWith(prefix) ? it.path.slice(prefix.length) : null) : it.path;
         if (key === null || key === '') return false;
         return !matchAny(key, cfg.matchers);
       });
-      // 镜像写盘（1.8.12）：本地内容哈希对账——算本地文件的 git blob oid 与远端比对，
-      // 一致才跳过（跳过的是「内容确实相同」，含远端未变+本地也没动）；本地改过的一律覆盖写
       let written = 0;
       let skipped = 0;
-      const manifestMap = {}; // path→blob sha：克隆即建增量底账（1.8.5），下次限速模式直接增量
+      const manifestMap = {};
       for (const it of targets) {
         if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
         const key = prefix ? it.path.slice(prefix.length) : it.path;
-        manifestMap[it.path] = it.oid; // 跳写与否都记入新账，保持账完整
+        manifestMap[it.path] = it.oid;
         const localPath = normalizePath(cfg.localPath ? cfg.localPath + '/' + key : key);
         try {
           const buf = await this.app.vault.adapter.readBinary(localPath);
           const { oid: localOid } = await isogit.git.hashBlob({ object: new Uint8Array(buf) });
-          if (localOid === it.oid) { skipped++; continue; } // 本地与远端逐字节一致：连 readBlob 都不做
+          if (localOid === it.oid) { skipped++; continue; }
         } catch (e) { /* 本地不存在/读取失败 → 覆盖写 */ }
         const { blob } = await isogit.git.readBlob({ fs: fsp, dir: CLONE_DIR, oid: it.oid });
         await this.ensureDirFor(localPath);
@@ -649,52 +614,39 @@ class GitPullPlugin extends Plugin {
         notice.setMessage(this.t('write_progress', { i: written, n: targets.length }));
         if (this._statusEl) this._statusEl.setText('⬇ ' + this.t('write_progress', { i: written, n: targets.length }));
       }
-      // 落盘底账：与增量模式同格式（ref + files），限速模式下次起真增量
       try {
         await this.ensureDirFor(this.manifestKey(cfg.owner, cfg.repo));
         await this.app.vault.adapter.write(this.manifestKey(cfg.owner, cfg.repo), JSON.stringify({ ref: cfg.ref || 'HEAD', files: manifestMap }));
-      } catch (e) { /* 底账失败只影响下次增量效率，不影响本次结果 */ }
+      } catch (e) { /* 底账失败只影响下次增量效率 */ }
       const cS = Math.max(1, Math.round((t2 - t1) / 1000));
       const wS = Math.max(1, Math.round((Date.now() - t2) / 1000));
       notice.hide();
-      // 分段耗时：手机端 87s 类问题的现场仪表——验证/下载/写盘哪段慢一眼可辨
       new Notice(this.t('clone_ok', { n: written, m: all.length - targets.length, s: skipped, v: vS, c: cS, w: wS }), 8000);
-      console.log(`[${PLUGIN_ID}] clone: verify=${vS}s clone=${cS}s write=${wS}s (${written} written, ${skipped} skipped)`);
+      console.log('[' + PLUGIN_ID + '] clone: verify=' + vS + 's clone=' + cS + 's write=' + wS + 's (' + written + ' written, ' + skipped + ' skipped)');
     } finally {
       try {
         await this.fsRmrf(fsp, CLONE_DIR + '/.git');
-        await fsp.promises.rmdir(CLONE_DIR + '/.git'); // fsRmrf 只清内容，目录壳补删
-      } catch (e) { /* 已不存在等场景忽略 */ }
+        await fsp.promises.rmdir(CLONE_DIR + '/.git');
+      } catch (e) { /* 忽略 */ }
     }
   }
 
-  /** 增量底账路径（克隆建账与增量续传共用）：平台-仓库-子目录 slug，切范围互不干扰 */
-  manifestKey(owner, repo) {
-    const rpSlug = ((this.settings.remotePath || '').replace(/^\/+|\/+$/g, '').replace(/[^a-zA-Z0-9._-]+/g, '-') || 'root');
-    return normalizePath('.xu-git-pull/' + (this.settings.platform || 'github') + '-' + owner + '-' + repo + '-' + rpSlug + '.json');
-  }
+  // ---------------- 限速增量（tree 清单对比 + 逐文件限速下载 + 断点续传） ----------------
 
-  /** 增量同步（移动端大仓专用）：tree API 拿全量清单 → 与本地 manifest 按 blob sha 对比 → 限速逐文件下载。
-   *  内存占用 O(单文件)，永不 OOM；manifest 记在 vault/.xu-git-pull/（换设备可续传），每 20 个文件落盘断点。
-   *  无底账（首次/换分支/换设备）：manifest 默认空账 → 全部文件视为变更 → 逐文件限速下载建账。
-   *  全程不调用克隆（1.9.1 彻底分离）——增量任何分支不碰 pullViaClone，手机大仓永不 OOM。 */
   async pullIncremental(cfg, notice) {
     const owner = cfg.owner;
     const repo = cfg.repo;
     const refName = cfg.ref || 'HEAD';
-    // ref 校验：与克隆模式同源（ls-remote），分支不存在给清晰错误
     const url = this.gitRemoteUrl(owner, repo);
     const { refs } = await this.verifyRemote(url);
     if (cfg.ref && !(refs.heads && refs.heads[cfg.ref] !== undefined)) {
       throw Object.assign(new Error(this.t('notice_ref_not_found', { ref: cfg.ref })), { code: 'verify' });
     }
     if (this._cancelAll) { const e = new Error('aborted'); e.code = 'aborted'; throw e; }
-    // ① 全量文件清单（tree API：GitHub/Gitee 单请求，GitCode 分页自动翻页合并）
     notice.setMessage(this.t('incr_tree'));
     const data = await this.fetchTreeAll(owner, repo, refName);
     if (data.truncated) throw new Error(this.t('incr_truncated'));
 
-    // ② 过滤（子目录/排除 glob/.obsidian 开关），与克隆模式同规则
     const prefix = cfg.remotePath ? cfg.remotePath.replace(/\/+$/, '') + '/' : '';
     const targets = [];
     for (const it of data.tree || []) {
@@ -711,26 +663,23 @@ class GitPullPlugin extends Plugin {
       targets.push({ key, path: p, sha: it.sha, size: Number(it.size) || 0 });
     }
 
-    // ③ 本地 manifest（上次成功下载的 path→sha 快照；换分支/换子目录则重置全量重下）
-    // mKey 含子目录 slug：切换 remotePath 后新旧范围互不干扰，避免误删旧范围文件
     const mKey = this.manifestKey(owner, repo);
     let manifest = { ref: refName, files: {} };
     try {
       const prev = JSON.parse(await this.app.vault.adapter.read(mKey));
       if (prev && prev.ref === refName && prev.files && typeof prev.files === 'object') manifest = prev;
-    } catch (e) { /* 无清单 → 全量 */ }
+    } catch (e) { /* 无清单 → 全量建账 */ }
 
-    // ③′ 远程删除同步：manifest 记录里有、本次远程清单没有的 → 本地删除。
-    // 必须在 changed==0 提前返回之前：远程「只删文件」时 changed 为空，漏掉这步会永久漂移
+    // 远程删除同步：manifest 有而远程清单无 → 删本地（必须在 changed==0 提前返回之前）
     const have = new Set(targets.map((t) => t.path));
     const goneKeys = Object.keys(manifest.files).filter((p) => !have.has(p));
     let deleted = 0;
     if (goneKeys.length > 0) {
-      const lp = cfg.localPath || ''; // 与写盘同源（trimSlashes 双侧裁剪），避免设置原值带前导斜杠/空格时删除目标错位
+      const lp = cfg.localPath || '';
       for (const gp of goneKeys) {
         const key = prefix ? (gp.startsWith(prefix) ? gp.slice(prefix.length) : null) : gp;
         delete manifest.files[gp];
-        if (key === null || key === '') continue; // 跨范围残键只清记录，本地映射不明不删
+        if (key === null || key === '') continue;
         try {
           const fp = normalizePath(lp + '/' + key);
           if (await this.app.vault.adapter.exists(fp)) { await this.app.vault.adapter.remove(fp); deleted++; }
@@ -741,38 +690,31 @@ class GitPullPlugin extends Plugin {
 
     const changed = targets.filter((t) => manifest.files[t.path] !== t.sha);
     const t0 = Date.now();
-
     if (changed.length === 0) {
       notice.hide();
       if (deleted > 0) new Notice(this.t('incr_done', { n: 0, m: 0, d: deleted, s: 0 }), 8000);
       else new Notice(this.t('incr_none', { total: targets.length }), 8000);
       return;
     }
-    notice.setMessage(this.t('incr_start', { n: changed.length, total: targets.length }));
+    notice.setMessage(this.t('incr_start', { n: 0, total: targets.length }));
     if (this._statusEl) this._statusEl.setText('⬇ 0/' + changed.length);
 
-    // ④ 限速逐文件下载（git blobs API 三平台同构；每 20 个文件落盘 manifest 断点）
     const rpm = (this.settings.ratePerMin && this.settings.ratePerMin[this.settings.platform]) || 40;
-    const gap = rpm > 0 ? Math.ceil(60000 / rpm) : 0; // 0 = 全速（帮助文档已提示不推荐）
+    const gap = rpm > 0 ? Math.ceil(60000 / rpm) : 0;
     const blobBase = this.apiBase() + '/repos/' + owner + '/' + repo + '/git/blobs/';
-    const BIG_FILE = 20 * 1024 * 1024; // base64 解码峰值 ≈ 3×文件大小，安卓 WebView 单文件 >20MB 有 OOM 风险
+    const BIG_FILE = 20 * 1024 * 1024;
     let lastTs = 0;
     let done = 0;
     let dirty = 0;
     const skipped = [];
     for (const t of changed) {
-      // 超大单文件：跳过（也记 sha，避免每次拉取重复提示）；需要该文件时去桌面端拉取
-      if (t.size > BIG_FILE) {
-        skipped.push(t.key);
-        manifest.files[t.path] = t.sha;
-        continue;
-      }
+      if (t.size > BIG_FILE) { skipped.push(t.key); manifest.files[t.path] = t.sha; continue; }
       if (this._cancelAll) {
         if (dirty > 0) await this.saveManifestSafe(mKey, manifest);
         const e = new Error('aborted'); e.code = 'aborted'; throw e;
       }
       const now = Date.now();
-      if (lastTs > 0 && now - lastTs < gap) await sleep(gap - (now - lastTs));
+      if (lastTs > 0 && gap > 0 && now - lastTs < gap) await sleep(gap - (now - lastTs));
       lastTs = Date.now();
       let bytes = null;
       let lastErr = null;
@@ -785,7 +727,6 @@ class GitPullPlugin extends Plugin {
         try {
           const info = await this.apiGetJson(blobBase + t.sha);
           if (info && typeof info.content === 'string' && info.encoding === 'base64') {
-            // 双保险：GitCode 的 tree 响应无 size 字段（大文件拦不住），按 base64 长度兜底（20MB ≈ 27MB base64）
             if (info.content.length > BIG_FILE * 1.4) { tooBig = true; break; }
             bytes = b64ToBytes(info.content.replace(/\s+/g, ''));
           }
@@ -793,22 +734,19 @@ class GitPullPlugin extends Plugin {
           break;
         } catch (err) {
           lastErr = err;
-          // 限流（403 配额/429）自动等 60s 重试；认证/仓库错误直接失败
           if (attempt < 5 && (err.code === 'rate_limited' || err.status === 429)) {
             notice.setMessage(this.t('incr_wait', { s: 60 }));
-            if (this._statusEl) this._statusEl.setText('⬇ ' + done + '/' + changed.length + ' (等待重试)');
+            if (this._statusEl) this._statusEl.setText('⬇ ' + done + '/' + changed.length + ' (...60s)');
             await sleep(60000);
-            notice.setMessage(this.t('incr_start', { n: changed.length, total: targets.length }));
-            continue;
+            notice.setMessage(this.t('incr_start', { n: done, total: targets.length }));
+          } else if (err.code === 'unauthorized' || err.code === 'not_found') {
+            throw err;
+          } else {
+            await sleep(1000 * (attempt + 1));
           }
-          break;
         }
       }
-      if (tooBig) {
-        skipped.push(t.key);
-        manifest.files[t.path] = t.sha;
-        continue;
-      }
+      if (tooBig) { skipped.push(t.key); manifest.files[t.path] = t.sha; continue; }
       if (!bytes) {
         if (lastErr) throw lastErr;
         throw new Error(this.t('clone_fail', { reason: 'blob ' + t.path + ' (empty content)' }));
@@ -820,7 +758,7 @@ class GitPullPlugin extends Plugin {
       dirty++;
       done++;
       if (dirty >= 20) { await this.saveManifestSafe(mKey, manifest); dirty = 0; }
-      notice.setMessage(this.t('incr_start', { n: changed.length, total: targets.length }) + ' — ' + done + '/' + changed.length);
+      notice.setMessage(this.t('incr_start', { n: done, total: targets.length }));
       if (this._statusEl) this._statusEl.setText('⬇ ' + done + '/' + changed.length);
     }
     await this.saveManifestSafe(mKey, manifest);
@@ -828,164 +766,43 @@ class GitPullPlugin extends Plugin {
     notice.hide();
     new Notice(this.t('incr_done', { n: done, m: targets.length - changed.length, d: deleted, s: secs }), 8000);
     if (skipped.length > 0) {
-      const list = skipped.slice(0, 3).join('、') + (skipped.length > 3 ? ' 等' : '');
+      const list = skipped.slice(0, 3).join(', ') + (skipped.length > 3 ? ' …' : '');
       new Notice(this.t('incr_skipped', { n: skipped.length, list }), 8000);
     }
   }
 
-  /** manifest 落盘（先建 .xu-git-pull/ 目录） */
-  async saveManifestSafe(key, obj) {
-    const dir = key.split('/').slice(0, -1).join('/');
-    try {
-      if (dir && !(await this.app.vault.adapter.exists(dir))) await this.app.vault.adapter.mkdir(dir);
-      await this.app.vault.adapter.write(key, JSON.stringify(obj));
-    } catch (e) {
-      // manifest 写失败不中断同步（下次全量对比，功能不受损）
-      console.error('[' + PLUGIN_ID + '] manifest save failed:', e);
-    }
-  }
+  // ---------------- 级联下拉数据（仓库 → 分支 → 子目录；仅设置页低频调用） ----------------
 
-
-  /** 仓库链路快照：抓取顶层活跃字段（切平台前调用） */
-  profileSnapshot() {
-    const s = this.settings;
-    return { repo: s.repo || '', ref: s.ref || '', remotePath: s.remotePath || '', localPath: s.localPath || '' };
-  }
-
-  /** 恢复仓库链路快照到顶层活跃字段（切平台后调用） */
-  applyProfile(snap) {
-    for (const k of PROFILE_KEYS) this.settings[k] = String((snap && snap[k]) || '');
-  }
-
-  headers() {
-    // GitHub 专用头只发给 GitHub；GitCode/Gitee API v5 兼容风格无需这些头
-    const h = {};
-    if ((this.settings.platform || 'github') === 'github') {
-      h.Accept = 'application/vnd.github+json';
-      h['X-GitHub-Api-Version'] = '2022-11-28';
-    }
-    const token = this.token();
-    if (token) h.Authorization = 'Bearer ' + token;
-    return h;
-  }
-
-  /** 解析并校验设置 */
-  resolveConfig() {
-    const platform = PLATFORMS.find((x) => x.id === this.settings.platform) || PLATFORMS.find((x) => x.available);
-    if (!platform.available) {
-      return { error: this.t('notice_platform_unsupported', { name: this.t('pn_' + platform.id) }) };
-    }
-    const repoRaw = trimSlashes(this.settings.repo);
-    if (!repoRaw) return { error: this.t('notice_no_repo') };
-    // owner/repo；Gitee/GitCode 允许嵌套命名空间（org/group/repo），URL 按完整路径拼接
-    const m = repoRaw.match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_./-]+?)(?:\.git)?$/);
-    if (!m) return { error: this.t('notice_repo_invalid') };
-
-    // 始终排除 .git/.trash；.obsidian 由开关决定；再拼用户自定义规则
-    const patterns = ['.git/**', '.trash/**'].concat(BUILTIN_EXCLUDES);
-    if (!this.settings.includeObsidian) patterns.push('.obsidian/**');
-    const matchers = patterns
-      .concat(String(this.settings.exclude || '').split('\n').map((s) => s.trim()))
-      .map(compileGlob)
-      .filter(Boolean);
-
-    return {
-      platform: platform.id,
-      owner: m[1],
-      repo: m[2],
-      // 下拉选择的分支（空 = 默认分支最新）
-      ref: trimSlashes(this.settings.ref),
-      remotePath: trimSlashes(this.settings.remotePath),
-      localPath: trimSlashes(this.settings.localPath),
-      matchers,
-    };
-  }
-
-  async apiGetJson(url) {
-    let res;
-    try {
-      res = await requestUrl({ url, method: 'GET', headers: this.headers() });
-    } catch (err) {
-      if (err && err.status === 401) {
-        const e = new Error(this.t('notice_unauthorized'));
-        e.code = 'unauthorized';
-        throw e;
-      }
-      if (err && (err.status === 404 || err.status === 422)) {
-        // 匿名访问私有库时 GitHub 同样返回 404（不暴露仓库存在性）
-        const e = new Error(this.t('notice_repo_not_found'));
-        e.code = 'not_found';
-        throw e;
-      }
-      if (err && err.status === 403) {
-        const remain = err.response?.headers?.['x-ratelimit-remaining'];
-        if (remain === '0' || remain === 0) {
-          const e = new Error(this.t('notice_rate_limited'));
-          e.code = 'rate_limited';
-          throw e;
-        }
-        // 403 也可能是令牌权限不足
-        const e = new Error(this.t('notice_unauthorized'));
-        e.code = 'unauthorized';
-        throw e;
-      }
-      throw err;
-    }
-    return res.json;
-  }
-
-  // ---------------- 级联下拉数据（仓库 → 分支 → 子目录） ----------------
-
-  cacheGet(key) {
-    return (this._listCache ||= {})[key];
-  }
-
-  cacheSet(key, value) {
-    (this._listCache ||= {})[key] = value;
-    return value;
-  }
-
+  cacheGet(key) { return (this._listCache ||= {})[key]; }
+  cacheSet(key, value) { (this._listCache ||= {})[key] = value; return value; }
   cacheClear(prefix) {
     const c = this._listCache ||= {};
-    for (const k of Object.keys(c)) {
-      if (!prefix || k.startsWith(prefix)) delete c[k];
-    }
+    for (const k of Object.keys(c)) if (!prefix || k.startsWith(prefix)) delete c[k];
   }
 
-  /** Token 可访问的仓库全名列表（最多 5 页 500 个） */
   async fetchRepoList(force) {
     const token = this.token();
     const key = 'repos:' + token;
-    if (!force) {
-      const hit = this.cacheGet(key);
-      if (hit) return hit;
-    }
+    if (!force) { const hit = this.cacheGet(key); if (hit) return hit; }
     if (!token) return [];
     const all = [];
     for (let page = 1; page <= 5; page++) {
-      const data = await this.apiGetJson(this.apiBase() + '/user/repos?per_page=100&page=' + page +
-        '&sort=updated&affiliation=owner,collaborator,organization_member');
+      const data = await this.apiGetJson(this.apiBase() + '/user/repos?per_page=100&page=' + page + '&sort=updated&affiliation=owner,collaborator,organization_member');
       all.push(...data);
       if (data.length < 100) break;
     }
     const names = all.map((r) => r.full_name).sort((a, b) => a.localeCompare(b));
-    // 换 token 时清掉下游缓存
     this.cacheClear('branches:');
     this.cacheClear('folders:');
     return this.cacheSet(key, names);
   }
 
-  /** 某仓库的分支名列表 */
   async fetchBranchList(owner, repo, force) {
     const key = 'branches:' + (this.token() ? 't' : 'a') + ':' + owner + '/' + repo;
-    if (!force) {
-      const hit = this.cacheGet(key);
-      if (hit) return hit;
-    }
+    if (!force) { const hit = this.cacheGet(key); if (hit) return hit; }
     const all = [];
     for (let page = 1; page <= 5; page++) {
-      const data = await this.apiGetJson(this.apiBase() + '/repos/' + owner + '/' + repo +
-        '/branches?per_page=100&page=' + page);
+      const data = await this.apiGetJson(this.apiBase() + '/repos/' + owner + '/' + repo + '/branches?per_page=100&page=' + page);
       all.push(...data.map((b) => b.name));
       if (data.length < 100) break;
     }
@@ -993,13 +810,9 @@ class GitPullPlugin extends Plugin {
     return this.cacheSet(key, all);
   }
 
-  /** 某仓库某分支下的文件夹路径列表（含根目录） */
   async fetchFolderList(owner, repo, branch, force) {
     const key = 'folders:' + (this.token() ? 't' : 'a') + ':' + owner + '/' + repo + '@' + (branch || ':default');
-    if (!force) {
-      const hit = this.cacheGet(key);
-      if (hit) return hit;
-    }
+    if (!force) { const hit = this.cacheGet(key); if (hit) return hit; }
     let ref = branch;
     if (!ref) {
       const info = await this.apiGetJson(this.apiBase() + '/repos/' + owner + '/' + repo);
@@ -1012,460 +825,275 @@ class GitPullPlugin extends Plugin {
       .sort((a, b) => a.localeCompare(b));
     return this.cacheSet(key, folders);
   }
-
-  async pull() {
-    const cfg = this.resolveConfig();
-    if (cfg.error) {
-      new Notice(cfg.error, 4000);
-      return;
-    }
-    // 插件级锁：克隆进行中拒绝重复触发（ribbon/命令双击）
-    if (this._pullBusy) {
-      new Notice(this.t('notice_pull_busy'), 3000);
-      return;
-    }
-    if (!isogit) {
-      new Notice(this.t('notice_isogit_missing'), 6000);
-      return;
-    }
-    this._pullBusy = true;
-    const n1 = new Notice(this.t('clone_checking'), 0);
-    this._cancelAll = false;
-    // 状态栏点击取消入口：标记后克隆自然结束时跳过写盘（克隆在途请求无法硬中断）
-    this._activeAbort = () => { this._cancelAll = true; };
-    if (this._statusEl) {
-      this._statusEl.setAttribute('title', this.t('statusbar_cancel_hint'));
-      this._statusEl.setText('⬇ ' + this.t('clone_checking'));
-    }
-    try {
-      // ── 下载模式：用户手动选择，按平台记忆（桌面/手机各自设置互不干扰）──
-      const platKey = Platform.isMobile ? 'mobile' : 'desktop';
-      const dm = this.settings.downloadMode && this.settings.downloadMode[platKey];
-      if (dm === 'incremental') {
-        const rpm = (this.settings.ratePerMin && this.settings.ratePerMin[this.settings.platform]) || 40;
-        const msg = this.t('incremental_hint', { rpm });
-        n1.setMessage(msg);
-        new Notice(msg, 4000);
-        await this.pullIncremental(cfg, n1);
-        return;
-      }
-      await this.pullViaClone(cfg, n1);
-    } catch (err) {
-      n1.hide();
-      if (this._cancelAll || (err && err.code === 'aborted')) {
-        new Notice(this.t('notice_aborted_simple'), 4000);
-        return;
-      }
-      if (err && err.code === 'verify') {
-        new Notice(err.message, 6000);
-        return;
-      }
-      console.error('[' + PLUGIN_ID + '] pull failed:', err);
-      // 手机端克隆失败大概率是 WebView 内存不足——引导切换限速增量模式
-      if (Platform.isMobile) new Notice(this.t('clone_fail_mobile_hint'), 8000);
-      new Notice(this.t('clone_fail', { reason: String((err && err.message) || err) }), 6000);
-    } finally {
-      this._pullBusy = false;
-      this._activeAbort = null;
-      if (this._statusEl) this._statusEl.setText('');
-    }
-  }
 }
 
 // ================================================================
-//  设置页（1.13 声明式 Path A）
+//  设置页（经典 display() API）
 // ================================================================
-/** 下载模式帮助弹窗（设置页「?」点击打开）：两种模式对比 + 限速建议依据 + 取消说明 */
-class DownloadModeHelpModal extends Modal {
-  constructor(plugin) {
-    super(plugin.app);
-    this.plugin = plugin;
-  }
-  onOpen() {
-    const p = this.plugin;
-    const { contentEl } = this;
-    // 标题用 div+class 而非 createEl('hN')——官方审核禁止 Modal/设置页手工拼 HTML 标题
-    contentEl.createEl('div', { cls: 'xgp-help-title', text: p.t('help_title') });
-    const sec = (title, text) => {
-      contentEl.createEl('div', { cls: 'xgp-help-h', text: title });
-      contentEl.createEl('p', { text, attr: { style: 'white-space: pre-line; margin: 4px 0 12px; font-size: 13px;' } });
-    };
-    sec(p.t('mode_full'), p.t('help_clone'));
-    sec(p.t('mode_incr'), p.t('help_incr'));
-    sec(p.t('setting_rate'), p.t('help_rate'));
-    contentEl.createEl('p', { text: p.t('help_cancel'), attr: { style: 'color: var(--text-muted); font-size: 12px;' } });
-  }
-  onClose() { this.contentEl.empty(); }
-}
-
 class GitPullSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
-    this._tgFull = null; // 全量覆盖 ToggleComponent 引用（直切互斥用）
-    this._tgIncr = null; // 限速增量 ToggleComponent 引用
-    this._xgpModeBusy = false; // 模式切换重入锁
   }
 
-  t(key, params) { return this.plugin.t(key, params); }
-
-  // 下载模式切换（直切式二选一，1.9.1）：两个 toggle 恒为一开一关（radio 语义），全程无提示弹窗。
-  // toggle 的 change 事件栈内绝不调用 this.update()——同步重绘会与声明式渲染器重入堆叠（1.8.8 无限循环 bug）。
-  //   勾选一个 → 存储即该模式，兄弟开关程序化 setValue(false) 直接熄灭（不触发 onChange、不弹提示）
-  //   熄灭唯一亮着的 → 静默回弹 setValue(true)：单选态不可清空，可见状态与存储恒一致，
-  //   重开设置页/重启应用后渲染读存储，即上一次的选择（持久化）
-  // 改存储后延迟 30ms 在事件栈外重绘（刷新限速行 visible），加重入锁兜底
-  _onModeToggle(platKey, mode, v) {
-    const self = mode === 'clone' ? this._tgFull : this._tgIncr;
-    const other = mode === 'clone' ? this._tgIncr : this._tgFull;
-    if (!v) { // 熄灭亮着的那个：单选态不可清空，静默回弹，存储不变
-      if (self) self.setValue(true);
-      return;
-    }
-    if (other && other.getValue()) other.setValue(false); // 直接关闭另一项（无提示）
-    if (this._xgpModeBusy) return;
-    this._xgpModeBusy = true;
+  display() {
+    const { containerEl } = this;
+    containerEl.empty();
     const p = this.plugin;
-    if (!p.settings.downloadMode || typeof p.settings.downloadMode !== 'object') p.settings.downloadMode = {}; // 类型守卫：防旧版字符串格式穿透
-    p.settings.downloadMode[platKey] = mode;
-    void p.saveSettings().then(() => {
-      setTimeout(() => { this._xgpModeBusy = false; this.update(); }, 30);
+    const s = p.settings;
+
+    // 标准头（官方审核要求：设置页标题必须 Setting.setHeading，禁止 createEl('hX')）
+    new Setting(containerEl).setName(p.t('setting_title')).setDesc(p.t('plugin_desc')).setHeading();
+
+    // 1. 语言
+    new Setting(containerEl)
+      .setName(p.t('set_language'))
+      .setDesc(p.t('set_language_desc'))
+      .addDropdown((dd) => dd
+        .addOption('zh', '中文')
+        .addOption('en', 'English')
+        .setValue(s.language)
+        .onChange(async (v) => { s.language = v; await p.saveSettings(); this.display(); }));
+
+    // 2. 平台
+    const pf = s.profiles[s.platform] || {};
+    new Setting(containerEl)
+      .setName(p.t('set_platform'))
+      .setDesc(p.t('set_platform_desc'))
+      .addDropdown((dd) => {
+        for (const cfg of PLATFORMS) dd.addOption(cfg.id, (cfg.id === 'gitcode' ? '🇨🇳 ' : '🌐 ') + cfg.name);
+        dd.setValue(s.platform).onChange(async (v) => {
+          s.platform = v;
+          await p.saveSettings();
+          this.display();
+        });
+      });
+
+    // 3. Token（失焦保存 + 清下游缓存）
+    new Setting(containerEl)
+      .setName(p.t('set_token'))
+      .setDesc(p.t('set_token_desc'))
+      .addText((tx) => {
+        tx.inputEl.type = 'password';
+        tx.inputEl.addClass('xgp-wide');
+        tx.setPlaceholder('token')
+          .setValue(s.tokens[s.platform] || '')
+          .onChange(async (v) => {
+            s.tokens[s.platform] = v.trim();
+            p.cacheClear('repos:');
+            await p.saveSettings();
+          });
+        tx.inputEl.addEventListener('blur', () => this.display());
+      })
+      .addExtraButton((btn) => btn
+        .setIcon('file-text')
+        .setTooltip(p.t('set_token_doc'))
+        .onClick(() => {
+          navigator.clipboard.writeText(p.platformCfg().tokenDoc);
+          new Notice(p.t('notice_token_doc_copy'), 4000);
+        }));
+
+    // 4. 仓库（级联下拉：token 仓库列表 + 当前值兜底 + 刷新）
+    const repoSetting = new Setting(containerEl)
+      .setName(p.t('set_repo'))
+      .setDesc(p.t('set_repo_desc'));
+    this.buildCascade(repoSetting, {
+      getValue: () => pf.repo || '',
+      setValue: async (v) => { pf.repo = v; await p.saveSettings(); },
+      placeholder: p.t('set_repo_placeholder'),
+      getCached: () => p.cacheGet('repos:' + p.token()),
+      fetchList: async (force) => {
+        const m = (pf.repo || '').split('/');
+        if (m.length < 2) return [];
+        const list = await p.fetchRepoList(force);
+        return list.length ? list : null; // null = 无 token/拉取失败 → 保持手填
+      },
     });
-  }
 
-  getSettingDefinitions() {
-    const p = this.plugin;
-    // 每次重绘计数 +1，异步回调据此丢弃过期结果
-    this.seq = (this.seq || 0) + 1;
-    return [
-      // 头部说明（empty 定义，不进搜索）
-      { name: p.t('setting_title'), desc: p.t('setting_header_desc'), searchable: false },
-      // 界面语言（页面顶部：切语言立即全页重绘）
-      {
-        name: p.t('setting_language'),
-        render: (setting) => {
-          setting.addDropdown((d) => {
-            d.addOptions({ zh: p.t('lang_zh'), en: p.t('lang_en') });
-            d.setValue(p.settings.language);
-            d.onChange(async (v) => {
-              p.settings.language = v;
+    // 5. 分支
+    const refSetting = new Setting(containerEl)
+      .setName(p.t('set_ref'))
+      .setDesc(p.t('set_ref_desc'));
+    this.buildBranchCascade(refSetting);
+
+    // 6. 子目录
+    const rpSetting = new Setting(containerEl)
+      .setName(p.t('set_remote_path'))
+      .setDesc(p.t('set_remote_path_desc'));
+    this.buildFolderCascade(rpSetting);
+
+    // 7. 本地目标目录
+    new Setting(containerEl)
+      .setName(p.t('set_local_path'))
+      .setDesc(p.t('set_local_path_desc'))
+      .addText((tx) => tx
+        .setPlaceholder('e.g. notes/remote')
+        .setValue(pf.localPath || '')
+        .onChange(async (v) => { pf.localPath = v; await p.saveSettings(); }));
+
+    // 8. 下载模式（单个下拉，二选一，无互斥）
+    const platKey = Platform.isMobile ? 'mobile' : 'desktop';
+    new Setting(containerEl)
+      .setName(p.t('set_mode'))
+      .setDesc(p.t('set_mode_desc'))
+      .addDropdown((dd) => dd
+        .addOption('clone', p.t('set_mode_clone'))
+        .addOption('incremental', p.t('set_mode_incr'))
+        .setValue(s.downloadMode[platKey] || 'clone')
+        .onChange(async (v) => {
+          s.downloadMode[platKey] = v;
+          await p.saveSettings();
+          this.display(); // 限速行随模式显隐
+        }));
+
+    // 9. 每分钟请求数（仅增量模式显示）
+    if ((s.downloadMode[platKey] || 'clone') === 'incremental') {
+      new Setting(containerEl)
+        .setName(p.t('set_rpm'))
+        .setDesc(p.t('set_rpm_desc'))
+        .addText((tx) => {
+          tx.inputEl.type = 'number';
+          tx.inputEl.addClass('xgp-narrow');
+          tx.setValue(String(s.ratePerMin[s.platform] != null ? s.ratePerMin[s.platform] : ''))
+            .setPlaceholder(String(p.platformCfg().rpm))
+            .onChange(async (v) => {
+              const n = Number(v);
+              s.ratePerMin[s.platform] = Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
               await p.saveSettings();
-              this.update();
             });
-          });
-        },
-      },
-      {
-        type: 'group',
-        heading: p.t('sec_repo'),
-        items: [
-          // 1. 平台下拉：决定下方 Token 字段名称与后续平台适配
-          {
-            name: p.t('setting_platform'),
-            desc: p.t('setting_platform_desc'),
-            render: (setting) => {
-              setting.addDropdown((d) => {
-                // 按组用 optgroup 展示：国内在前、国外在后；组名自带原生分隔，emoji 提供颜色锚点（原生下拉菜单不响应 CSS，emoji 是唯一可靠的「上色」方式）
-                for (const grp of ['domestic', 'overseas']) {
-                  const og = document.createElement('optgroup');
-                  og.label = p.t(grp === 'domestic' ? 'grp_domestic' : 'grp_overseas');
-                  for (const pf of PLATFORMS.filter((x) => x.group === grp)) {
-                    const o = document.createElement('option');
-                    o.value = pf.id;
-                    o.textContent = p.t('pn_' + pf.id);
-                    og.appendChild(o);
-                  }
-                  d.selectEl.appendChild(og);
-                }
-                d.setValue(p.settings.platform || 'github');
-                d.onChange(async (v) => {
-                  if (v !== (p.settings.platform || 'github')) {
-                    // 仓库链路配置按平台隔离：切走前快照当前整组，切入时恢复目标平台配置（未配置则全空）
-                    p.settings.profiles[p.settings.platform || 'github'] = p.profileSnapshot();
-                    p.settings.platform = v;
-                    if (!p.settings.profiles[v]) p.settings.profiles[v] = defaultProfile();
-                    p.applyProfile(p.settings.profiles[v]);
-                    // 所有远程下拉的数据源都变了，级联缓存全部作废
-                    p.cacheClear('repos:');
-                    p.cacheClear('branches:');
-                    p.cacheClear('folders:');
-                    await p.saveSettings();
-                  }
-                  this.update(); // 重绘后 Token 名称/内容与下游下拉跟随平台变化
-                });
-              });
-            },
-          },
-          // 2. Token：名称跟随所选平台（GitHub Token / GitCode Token / Gitee Token…）
-          {
-            name: p.t('setting_token', { name: this.platformBareName(p) }),
-            desc: p.t('setting_token_desc'),
-            render: (setting) => this.renderToken(setting),
-          },
-          // 3. 仓库地址：有 token → 下拉选择；无 token → 手填（公开库）
-          { name: p.t('setting_repo'), desc: p.t('setting_repo_desc'), render: (setting) => this.renderRepoSelect(setting) },
-          // 4. 分支下拉（无仓库时禁用）
-          { name: p.t('setting_ref'), desc: p.t('setting_ref_desc'), render: (setting) => this.renderBranchSelect(setting) },
-          // 5. 子目录下拉（无分支时禁用）
-          { name: p.t('setting_remote_path'), desc: p.t('setting_remote_path_desc'), render: (setting) => this.renderFolderSelect(setting) },
-          // 6. 本地目录仍用原生选择器
-          { name: p.t('setting_local_path'), desc: p.t('setting_local_path_desc'), control: { type: 'folder', key: 'localPath', placeholder: '/', includeRoot: true } },
-          // 7. 下载模式标题行：？帮助按钮集中在此行（1.8.11）；不放 desc 提示——两开关直切互斥（恒一开一关），语义自明
-          {
-            name: p.t('mode_title'),
-            render: (setting) => {
-              // ？以内联小圆点挂在标题名旁（1.9.0）：addButton 在手机端 control 区会被拉伸占满整行；
-              // ExtraButtonComponent 无 setButtonText（1.8.10 雷区），且 control 区方案手机端仍独占一行——
-              // 挂进 nameEl 与「下载模式」天然同行，宽度恒为一个字符，样式走 .xgp-help-dot（CSS 类，非静态样式）
-              const dot = setting.nameEl.createEl('a', { cls: 'xgp-help-dot', text: '?' });
-              dot.setAttribute('aria-label', p.t('btn_help'));
-              dot.addEventListener('click', (e) => { e.preventDefault(); new DownloadModeHelpModal(p).open(); });
-            },
-          },
-          // 8. 全量覆盖开关（原生 toggle）：与限速开关直切互斥（恒一开一关），规则见 _onModeToggle
-          {
-            name: p.t('mode_full'),
-            desc: p.t('mode_full_desc'),
-            render: (setting) => {
-              const platKey = Platform.isMobile ? 'mobile' : 'desktop';
-              setting.addToggle((tg) => {
-                this._tgFull = tg;
-                tg.setValue(((p.settings.downloadMode || {})[platKey]) !== 'incremental'); // 缺省即 clone
-                tg.onChange((v) => this._onModeToggle(platKey, 'clone', v));
-              });
-            },
-          },
-          // 9. 限速增量开关（原生 toggle）：与全量开关直切互斥（恒一开一关），规则见 _onModeToggle
-          {
-            name: p.t('mode_incr'),
-            desc: p.t('mode_incr_desc'),
-            render: (setting) => {
-              const platKey = Platform.isMobile ? 'mobile' : 'desktop';
-              setting.addToggle((tg) => {
-                this._tgIncr = tg;
-                tg.setValue(((p.settings.downloadMode || {})[platKey]) === 'incremental');
-                tg.onChange((v) => this._onModeToggle(platKey, 'incremental', v));
-              });
-            },
-          },
-          // 10. 限速值（visible 谓词：仅限速增量模式显示；defs 恒定 10 项，预填平台建议值，0 = 全速）
-          {
-            name: p.t('setting_rate') + '（' + this.platformBareName(p) + '）',
-            desc: (p.t('mode_incr_desc').split('；')[1] || '') + ' · GitCode 40 / GitHub 60 / Gitee 50，0 = 全速',
-            visible: () => ((((p.settings.downloadMode || {})[Platform.isMobile ? 'mobile' : 'desktop']) || 'clone') === 'incremental'),
-            render: (setting) => {
-              const plat = p.settings.platform || 'github';
-              setting.addText((text) => {
-                text.inputEl.type = 'number';
-                text.inputEl.min = '0';
-                text.inputEl.max = '600';
-                const rp = p.settings.ratePerMin || {};
-                text.setValue(String(rp[plat] != null ? rp[plat] : ''));
-                text.setPlaceholder(String(DEFAULT_SETTINGS.ratePerMin[plat] || 40));
-                text.onChange((v) => {
-                  p.settings.ratePerMin = p.settings.ratePerMin || {};
-                  const n = Math.max(0, Math.min(600, parseInt(v, 10) || 0));
-                  p.settings.ratePerMin[plat] = n;
-                  void p.saveSettings();
-                });
-              });
-            },
-          },
-        ],
-      },
-      {
-        type: 'group',
-        heading: p.t('sec_filter'),
-        items: [
-          { name: p.t('setting_include_obsidian'), desc: p.t('setting_include_obsidian_desc'), control: { type: 'toggle', key: 'includeObsidian' } },
-          { name: p.t('setting_exclude'), desc: p.t('setting_exclude_desc'), control: { type: 'textarea', key: 'exclude', rows: 3 } },
-        ],
-      },
-      // 立即拉取（行为跟随上方所选下载模式）
-      { name: p.t('action_pull'), desc: p.t('action_pull_desc'), action: () => { void p.pull(); } },
-      // 使用文档（页面最底：低频入口）
-      {
-        name: p.t('setting_docs'),
-        render: (setting) => {
-          setting.addButton((b) => {
-            b.setButtonText(p.t('btn_github'));
-            b.onClick(() => window.open(REPO_URL, '_blank'));
-          });
-        },
-      },
-    ];
-  }
-
-  // ---------------- 级联控件渲染 ----------------
-
-  // 当前平台条目（PLATFORMS 中匹配所选平台；异常时回退到可用平台）
-  currentPlatform(p) {
-    return PLATFORMS.find((x) => x.id === (p.settings.platform || 'github')) || PLATFORMS.find((x) => x.available);
-  }
-
-  // 当前平台的裸名称（如 GitHub / GitCode），用于 Token 字段名
-  platformBareName(p) {
-    return p.t('pn_' + this.currentPlatform(p).id);
-  }
-
-  // 复制链接并打开：手机端不便填长表单，复制后可转发到电脑操作
-  async copyLink(p, url) {
-    try {
-      await navigator.clipboard.writeText(url);
-      new Notice(p.t('notice_link_copied'), 2500);
-    } catch (_) { /* 复制失败时静默，仍打开链接 */ }
-    window.open(url, '_blank');
-  }
-
-  renderToken(setting) {
-    const p = this.plugin;
-    const pf = this.currentPlatform(p);
-    setting.addText((text) => {
-      text.inputEl.type = 'password';
-      text.setPlaceholder(p.t('ph_' + pf.id));
-      // 令牌按平台独立存储：切换平台后显示对应平台的令牌（未填则为空）
-      text.setValue((p.settings.tokens && p.settings.tokens[pf.id]) || '');
-      // 逐字输入只保存不重绘（避免焦点丢失）；失焦/回车后再级联加载
-      text.onChange((v) => {
-        p.settings.tokens = p.settings.tokens || {};
-        p.settings.tokens[pf.id] = v.trim();
-        void p.saveSettings();
-      });
-      text.inputEl.addEventListener('blur', () => {
-        p.cacheClear('repos:');
-        p.cacheClear('branches:');
-        p.cacheClear('folders:');
-        this.update();
-      });
-      text.inputEl.addEventListener('keydown', (ev) => {
-        if (ev.key === 'Enter') text.inputEl.blur();
-      });
-    });
-    // 文档/创建按钮：链接跟随所选平台，点击复制到剪贴板（Notice 提示）并打开
-    setting.addButton((b) => {
-      b.setButtonText(p.t('btn_token_docs'));
-      b.onClick(() => { void this.copyLink(p, pf.tokenDoc[p.settings.language] || pf.tokenDoc.zh); });
-    });
-    setting.addButton((b) => {
-      b.setButtonText(p.t('btn_token_create'));
-      b.onClick(() => { void this.copyLink(p, pf.tokenCreate); });
-    });
-  }
-
-  renderRepoSelect(setting) {
-    const p = this.plugin;
-    if (!p.token()) {
-      // 无 Token：手填 owner/repo（公开库），由声明式 text 控件持久化
-      setting.addText((t) => {
-        t.setPlaceholder('owner/repo');
-        t.setValue(p.settings.repo);
-        t.onChange((v) => { p.settings.repo = v.trim(); void p.saveSettings(); });
-        // 失焦后重绘，让下方分支/提交/子目录下拉跟随新仓库
-        t.inputEl.addEventListener('blur', () => { this.update(); });
-      });
-      return;
+        });
     }
-    this.bindAsyncSelect(setting, {
-      current: p.settings.repo,
-      hint: p.t('ref_select_first'),
-      loader: (force) => p.fetchRepoList(force).then((names) => names.map((n) => ({ value: n, label: n }))),
-      refresh: () => p.cacheClear('repos:'),
-      onPick: async (v) => {
-        p.settings.repo = v;
-        p.settings.ref = '';
-        p.settings.remotePath = '';
-        await p.saveSettings();
-        this.update();
-      },
+
+    // 10. 过滤组
+    new Setting(containerEl)
+      .setName(p.t('set_obsidian'))
+      .setDesc(p.t('set_obsidian_desc'))
+      .addToggle((tg) => tg.setValue(s.includeObsidian).onChange(async (v) => { s.includeObsidian = v; await p.saveSettings(); }));
+
+    new Setting(containerEl)
+      .setName(p.t('set_exclude'))
+      .setDesc(p.t('set_exclude_desc'))
+      .addTextArea((tx) => {
+        tx.inputEl.addClass('xgp-wide');
+        tx.inputEl.rows = 3;
+        tx.setValue(s.exclude || '')
+          .setPlaceholder('*.log\ntmp/')
+          .onChange(async (v) => { s.exclude = v; await p.saveSettings(); });
+      });
+
+    // 11. 立即拉取
+    new Setting(containerEl)
+      .setName(p.t('set_pull'))
+      .setDesc(p.t('set_pull_desc'))
+      .addButton((btn) => btn
+        .setButtonText(p.t('pull_btn'))
+        .setCta()
+        .onClick(() => p.pull()));
+
+    // 12. 使用文档
+    new Setting(containerEl)
+      .setName(p.t('set_docs'))
+      .addExtraButton((btn) => btn
+        .setIcon('github')
+        .setTooltip(REPO_URL)
+        .onClick(() => window.open(REPO_URL)));
+  }
+
+  /** 仓库级联：下拉（token 列表 + 当前值兜底）+ 刷新按钮；列表不可用时保持手填 */
+  buildCascade(setting, opts) {
+    const current = opts.getValue();
+    const cached = opts.getCached ? opts.getCached() : null;
+    const list = cached && cached.length ? cached : (current ? [current] : []);
+    const options = list.slice();
+    if (!options.some((x) => x === '')) options.unshift(''); // 首项恒为空值（显示 placeholder，可主动清空）
+    setting.addDropdown((dd) => {
+      for (const item of options) dd.addOption(item, item || opts.placeholder || ' ');
+      dd.selectEl.addClass('xgp-dropdown-wide');
+      dd.setValue(current);
+      dd.selectEl.addEventListener('change', async (ev) => {
+        await opts.setValue(ev.target.value);
+      });
     });
+    setting.addExtraButton((btn) => btn
+      .setIcon('refresh-cw')
+      .setTooltip(this.plugin.t('refresh'))
+      .onClick(async () => {
+        btn.setIcon('loader-2');
+        try { await opts.fetchList(true); } catch (e) { new Notice(String((e && e.message) || e), 5000); }
+        this.display();
+      }));
   }
 
-  parseRepo() {
-    // 与 resolveConfig 一致：允许嵌套命名空间（org/group/repo）
-    const m = String(this.plugin.settings.repo || '').match(/^([A-Za-z0-9_.-]+)\/([A-Za-z0-9_./-]+?)(?:\.git)?$/);
-    return m ? { owner: m[1], repo: m[2] } : null;
-  }
-
-  renderBranchSelect(setting) {
+  buildBranchCascade(setting) {
     const p = this.plugin;
-    const r = this.parseRepo();
-    if (!r) {
-      setting.addDropdown((d) => { d.addOptions({ '': p.t('ref_select_first') }); d.setDisabled(true); });
-      return;
-    }
-    this.bindAsyncSelect(setting, {
-      current: p.settings.ref,
-      hint: p.t('ref_default'),
-      loader: (force) => p.fetchBranchList(r.owner, r.repo, force).then((names) => names.map((n) => ({ value: n, label: n }))),
-      refresh: () => p.cacheClear('branches:'),
-      onPick: async (v) => {
-        p.settings.ref = v;
-        p.settings.remotePath = '';
+    const s = p.settings;
+    const pf = s.profiles[s.platform] || {};
+    const m = (pf.repo || '').split('/');
+    const owner = m[0], repo = m.slice(1).join('/');
+    const current = pf.ref || '';
+    const cached = owner && repo ? p.cacheGet('branches:' + (p.token() ? 't' : 'a') + ':' + owner + '/' + repo) : null;
+    const list = cached && cached.length ? cached : [];
+    const options = [{ v: '', label: p.t('set_ref_default') }].concat(list.map((b) => ({ v: b, label: b })));
+    if (current && !options.some((o) => o.v === current)) options.push({ v: current, label: current });
+    setting.addDropdown((dd) => {
+      for (const o of options) dd.addOption(o.v, o.label);
+      dd.selectEl.addClass('xgp-dropdown-wide');
+      dd.setValue(current);
+      dd.selectEl.addEventListener('change', async (ev) => {
+        pf.ref = ev.target.value;
         await p.saveSettings();
-        this.update();
-      },
+      });
+      if (!owner || !repo) dd.setDisabled(true);
     });
+    setting.addExtraButton((btn) => btn
+      .setIcon('refresh-cw')
+      .setTooltip(p.t('refresh'))
+      .onClick(async () => {
+        if (!owner || !repo) return;
+        btn.setIcon('loader-2');
+        try { await p.fetchBranchList(owner, repo, true); } catch (e) { new Notice(String((e && e.message) || e), 5000); }
+        this.display();
+      }));
   }
 
-  renderFolderSelect(setting) {
+  buildFolderCascade(setting) {
     const p = this.plugin;
-    const r = this.parseRepo();
-    if (!r) {
-      setting.addDropdown((d) => { d.addOptions({ '': p.t('folder_select_first') }); d.setDisabled(true); });
-      return;
-    }
-    this.bindAsyncSelect(setting, {
-      current: p.settings.remotePath,
-      hint: p.t('folder_root'),
-      loader: (force) => p.fetchFolderList(r.owner, r.repo, p.settings.ref, force)
-        .then((paths) => paths.map((x) => ({ value: x, label: x + '/' }))),
-      refresh: () => p.cacheClear('folders:'),
-      onPick: async (v) => {
-        p.settings.remotePath = v;
+    const s = p.settings;
+    const pf = s.profiles[s.platform] || {};
+    const m = (pf.repo || '').split('/');
+    const owner = m[0], repo = m.slice(1).join('/');
+    const current = pf.remotePath || '';
+    const cached = owner && repo ? p.cacheGet('folders:' + (p.token() ? 't' : 'a') + ':' + owner + '/' + repo + '@' + (pf.ref || ':default')) : null;
+    const list = cached && cached.length ? cached : [];
+    const options = [{ v: '', label: p.t('set_remote_root') }].concat(list.map((f) => ({ v: f, label: '/' + f })));
+    if (current && !options.some((o) => o.v === current)) options.push({ v: current, label: '/' + current });
+    setting.addDropdown((dd) => {
+      for (const o of options) dd.addOption(o.v, o.label);
+      dd.selectEl.addClass('xgp-dropdown-wide');
+      dd.setValue(current);
+      dd.selectEl.addEventListener('change', async (ev) => {
+        pf.remotePath = ev.target.value;
         await p.saveSettings();
-      },
+      });
+      if (!owner || !repo) dd.setDisabled(true);
     });
-  }
-
-  /**
-   * 通用异步下拉：加载中禁用 → 到达后填充；带刷新按钮。
-   * 过期渲染（seq 不符）的结果直接丢弃。
-   */
-  bindAsyncSelect(setting, opts) {
-    const p = this.plugin;
-    const seq = this.seq;
-    let dropdown;
-    setting.addDropdown((d) => {
-      dropdown = d;
-      d.addOptions({ '': p.t('list_loading') });
-      d.setDisabled(true);
-    });
-    setting.addButton((b) => {
-      b.setIcon('refresh-cw');
-      b.setTooltip(p.t('btn_refresh'));
-      b.onClick(() => { opts.refresh?.(); this.update(); });
-    });
-
-    opts.loader(false).then((items) => {
-      if (seq !== this.seq) return;
-      dropdown.selectEl.empty();
-      const options = { '': opts.hint || p.t('list_loading') };
-      for (const it of items) options[it.value] = it.label;
-      dropdown.addOptions(options);
-      const cur = opts.current;
-      dropdown.setValue(cur != null && cur !== '' && options[cur] != null ? cur : '');
-      dropdown.onChange((v) => { void opts.onPick(v); });
-      dropdown.setDisabled(false);
-    }).catch((err) => {
-      if (seq !== this.seq) return;
-      dropdown.selectEl.empty();
-      dropdown.addOptions({ '': p.t('list_failed') });
-      console.error('[' + PLUGIN_ID + '] list load failed:', err);
-    });
+    setting.addExtraButton((btn) => btn
+      .setIcon('refresh-cw')
+      .setTooltip(p.t('refresh'))
+      .onClick(async () => {
+        if (!owner || !repo) return;
+        btn.setIcon('loader-2');
+        try { await p.fetchFolderList(owner, repo, pf.ref, true); } catch (e) { new Notice(String((e && e.message) || e), 5000); }
+        this.display();
+      }));
   }
 }
 
-// 设置页类挂为静态属性，便于自动化测试；默认导出仍为插件主类
+// Obsidian 插件加载器约定：默认导出插件类本身；SettingTab 挂静态属性供加载器注册
 GitPullPlugin.SettingTab = GitPullSettingTab;
-
+// 纯函数挂静态属性，供 e2e 直接断言（运行时无副作用）
+GitPullPlugin.normalizeSettings = normalizeSettings;
+GitPullPlugin.compileGlob = compileGlob;
+GitPullPlugin.matchAny = matchAny;
+GitPullPlugin.DEFAULT_SETTINGS = DEFAULT_SETTINGS;
 module.exports = GitPullPlugin;
