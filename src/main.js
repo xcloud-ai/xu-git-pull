@@ -1,10 +1,12 @@
 /* XU Git Pull v2 — 远程资料拉取：从 GitHub/GitCode/Gitee 整仓克隆或限速增量同步到 vault
  * v2 重写要点：设置页回归经典 display() API（下载模式下拉单选，根治声明式双开关三次翻车）；
- * 设置加载 normalizeSettings 逐字段类型校验（根治旧格式穿透）；下载链路沿用已验证设计。 */
+ * 设置加载 normalizeSettings 逐字段类型校验（根治旧格式穿透）；下载链路沿用已验证设计。
+ * v2.2：级联列表改统一「刷新列表」按钮（缓存无 TTL，远端新建条目需手动强刷）+
+ * 本地目标目录 FolderSuggest 建议弹层（可选可手填，新目录下载时逐级创建）。 */
 'use strict';
 
 const obsidianApi = require('obsidian');
-const { Plugin, Notice, Setting, PluginSettingTab, requestUrl, normalizePath, Platform } = obsidianApi;
+const { Plugin, Notice, Setting, PluginSettingTab, AbstractInputSuggest, requestUrl, normalizePath, Platform } = obsidianApi;
 
 // isomorphic-git bundle（v1.44.2 + LightningFS）：源码形态静态 require（Node e2e 可 mock），
 // 发版经 build.sh 内联进 main.js——移动端 Capacitor 对 require 相对路径不可靠，内联是唯一可靠形态
@@ -140,7 +142,10 @@ const I18N = {
     set_ref_default: '默认分支（最新）',
     set_remote_path: '仓库子目录', set_remote_path_desc: '只拉取该子目录；「/」表示整个仓库',
     set_remote_root: '/（整个仓库）',
-    set_local_path: '本地目标目录', set_local_path_desc: '下载到库中的位置，留空表示库根目录',
+    set_local_path: '本地目标目录', set_local_path_desc: '下载到库中的位置，留空表示库根目录；点击输入框可从建议中选择',
+    set_refresh_lists: '刷新列表', set_refresh_lists_desc: '列表有缓存，远端新建的仓库/分支/子目录不会自动出现；点击强制重新拉取',
+    refreshing: '刷新中…',
+    suggest_root: '（库根目录）',
     set_mode: '下载模式', set_mode_desc: '全量覆盖=速度最快；限速增量=只下变更、内存占用极小、断点续传',
     set_mode_clone: '全量覆盖（整仓克隆，桌面推荐）',
     set_mode_incr: '限速增量（逐文件下载，手机/大仓推荐）',
@@ -196,7 +201,10 @@ const I18N = {
     set_ref_default: 'Default branch (latest)',
     set_remote_path: 'Repository subfolder', set_remote_path_desc: 'Only pull this subfolder; "/" means the whole repo',
     set_remote_root: '/ (whole repo)',
-    set_local_path: 'Local target folder', set_local_path_desc: 'Where files land in the vault; empty = vault root',
+    set_local_path: 'Local target folder', set_local_path_desc: 'Where files land in the vault; empty = vault root; click the box to pick from suggestions',
+    set_refresh_lists: 'Refresh lists', set_refresh_lists_desc: "Lists are cached; newly created repos/branches/folders won't show up automatically. Click to force re-fetch",
+    refreshing: 'Refreshing…',
+    suggest_root: '(vault root)',
     set_mode: 'Download mode', set_mode_desc: 'Full clone = fastest; Rate-limited incremental = only changes, tiny memory, resumable',
     set_mode_clone: 'Full clone (desktop recommended)',
     set_mode_incr: 'Rate-limited incremental (mobile/large repos)',
@@ -841,6 +849,39 @@ class GitPullPlugin extends Plugin {
 // ================================================================
 //  设置页（经典 display() API）
 // ================================================================
+
+/** 本地目录建议弹层（官方 AbstractInputSuggest 模式）：输入框聚焦/输入时列出库内目录，
+ *  点击选中回填；不拦截手填——不存在的新目录仍可输入，下载时逐级自动创建 */
+class FolderSuggest extends AbstractInputSuggest {
+  constructor(app, inputEl, onPick, rootLabel) {
+    super(app, inputEl);
+    this._onPick = onPick;
+    this._rootLabel = rootLabel || '/';
+  }
+  /** 深度优先收集全部目录（父目录在前，排序稳定），按输入过滤，限 60 条防长列表卡顿 */
+  getSuggestions(query) {
+    const q = String(query || '').toLowerCase().replace(/^\/+|\/+$/g, '');
+    const folders = [];
+    const walk = (f) => {
+      for (const c of f.children) {
+        if (c.children) { folders.push(c); walk(c); }
+      }
+    };
+    walk(this.app.vault.getRoot());
+    const all = [{ isRoot: true, path: '' }].concat(folders);
+    const hit = q ? all.filter((x) => x.path.toLowerCase().includes(q)) : all;
+    return hit.slice(0, 60);
+  }
+  renderSuggestion(item, el) {
+    el.setText(item.isRoot ? this._rootLabel : item.path);
+  }
+  selectSuggestion(item) {
+    this.inputEl.value = item.path;
+    this.close();
+    if (this._onPick) this._onPick(item.path);
+  }
+}
+
 class GitPullSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -906,7 +947,7 @@ class GitPullSettingTab extends PluginSettingTab {
           new Notice(p.t('notice_token_doc_copy'), 4000);
         }));
 
-    // 4. 仓库（级联下拉：token 仓库列表 + 当前值兜底 + 刷新）
+    // 4. 仓库（级联下拉：token 仓库列表 + 当前值兜底；刷新走下方统一「刷新列表」按钮）
     const repoSetting = new Setting(containerEl)
       .setName(p.t('set_repo'))
       .setDesc(p.t('set_repo_desc'));
@@ -915,12 +956,6 @@ class GitPullSettingTab extends PluginSettingTab {
       setValue: async (v) => { pf.repo = v; this._autoTried = {}; await p.saveSettings(); },
       placeholder: p.t('set_repo_placeholder'),
       getCached: () => p.cacheGet('repos:' + p.token()),
-      fetchList: async (force) => {
-        const m = (pf.repo || '').split('/');
-        if (m.length < 2) return [];
-        const list = await p.fetchRepoList(force);
-        return list.length ? list : null; // null = 无 token/拉取失败 → 保持手填
-      },
     });
 
     // 5. 分支
@@ -935,14 +970,38 @@ class GitPullSettingTab extends PluginSettingTab {
       .setDesc(p.t('set_remote_path_desc'));
     this.buildFolderCascade(rpSetting);
 
-    // 7. 本地目标目录
+    // 6.5 刷新列表（统一手动刷新：一次强制重拉仓库+分支+子目录，绕过缓存）
+    new Setting(containerEl)
+      .setName(p.t('set_refresh_lists'))
+      .setDesc(p.t('set_refresh_lists_desc'))
+      .addButton((btn) => btn
+        .setButtonText(p.t('refresh'))
+        .onClick(async () => {
+          btn.setButtonText(p.t('refreshing')).setDisabled(true);
+          const parts = (pf.repo || '').split('/');
+          const owner = parts[0], repo = parts.slice(1).join('/');
+          const jobs = [];
+          if (p.token()) jobs.push(() => p.fetchRepoList(true));
+          if (owner && repo) {
+            jobs.push(() => p.fetchBranchList(owner, repo, true));
+            jobs.push(() => p.fetchFolderList(owner, repo, pf.ref, true));
+          }
+          const results = await Promise.allSettled(jobs.map((run) => run()));
+          const failed = results.find((r) => r.status === 'rejected');
+          if (failed) new Notice(String((failed.reason && failed.reason.message) || failed.reason), 5000);
+          this.display();
+        }));
+
+    // 7. 本地目标目录（FolderSuggest：点击/输入弹出库内目录建议，点击选中；保留手填新目录能力）
     new Setting(containerEl)
       .setName(p.t('set_local_path'))
       .setDesc(p.t('set_local_path_desc'))
-      .addText((tx) => tx
-        .setPlaceholder('e.g. notes/remote')
-        .setValue(pf.localPath || '')
-        .onChange(async (v) => { pf.localPath = v; await p.saveSettings(); }));
+      .addText((tx) => {
+        tx.setPlaceholder('e.g. notes/remote')
+          .setValue(pf.localPath || '')
+          .onChange(async (v) => { pf.localPath = v; await p.saveSettings(); });
+        new FolderSuggest(this.app, tx.inputEl, async (path) => { pf.localPath = path; await p.saveSettings(); }, p.t('suggest_root'));
+      });
 
     // 8. 下载模式（单个下拉，二选一，无互斥）
     const platKey = Platform.isMobile ? 'mobile' : 'desktop';
@@ -1047,7 +1106,7 @@ class GitPullSettingTab extends PluginSettingTab {
     if (filled) this.display();
   }
 
-  /** 仓库级联：下拉（token 列表 + 当前值兜底）+ 刷新按钮；列表不可用时保持手填 */
+  /** 仓库级联：下拉（token 列表 + 当前值兜底）；列表不可用时保持手填，刷新走统一「刷新列表」按钮 */
   buildCascade(setting, opts) {
     const current = opts.getValue();
     const cached = opts.getCached ? opts.getCached() : null;
@@ -1062,14 +1121,6 @@ class GitPullSettingTab extends PluginSettingTab {
         await opts.setValue(ev.target.value);
       });
     });
-    setting.addExtraButton((btn) => btn
-      .setIcon('refresh-cw')
-      .setTooltip(this.plugin.t('refresh'))
-      .onClick(async () => {
-        btn.setIcon('loader-2');
-        try { await opts.fetchList(true); } catch (e) { new Notice(String((e && e.message) || e), 5000); }
-        this.display();
-      }));
   }
 
   buildBranchCascade(setting) {
@@ -1094,15 +1145,6 @@ class GitPullSettingTab extends PluginSettingTab {
       });
       if (!owner || !repo) dd.setDisabled(true);
     });
-    setting.addExtraButton((btn) => btn
-      .setIcon('refresh-cw')
-      .setTooltip(p.t('refresh'))
-      .onClick(async () => {
-        if (!owner || !repo) return;
-        btn.setIcon('loader-2');
-        try { await p.fetchBranchList(owner, repo, true); } catch (e) { new Notice(String((e && e.message) || e), 5000); }
-        this.display();
-      }));
   }
 
   buildFolderCascade(setting) {
@@ -1126,15 +1168,6 @@ class GitPullSettingTab extends PluginSettingTab {
       });
       if (!owner || !repo) dd.setDisabled(true);
     });
-    setting.addExtraButton((btn) => btn
-      .setIcon('refresh-cw')
-      .setTooltip(p.t('refresh'))
-      .onClick(async () => {
-        if (!owner || !repo) return;
-        btn.setIcon('loader-2');
-        try { await p.fetchFolderList(owner, repo, pf.ref, true); } catch (e) { new Notice(String((e && e.message) || e), 5000); }
-        this.display();
-      }));
   }
 }
 
