@@ -153,6 +153,8 @@ const I18N = {
     set_obsidian: '下载 .obsidian 配置目录', set_obsidian_desc: '开启后插件与外观配置跟随仓库同步；不希望覆盖本机配置时手动关闭',
     set_exclude: '额外排除规则（每行一个 glob）', set_exclude_desc: '已内置排除 .git/、.trash/、community-plugins.json、workspace.json；** 跨级、* 单级、tmp/ 匹配整个目录',
     set_pull: '立即拉取', set_pull_desc: '按当前配置从远程同步到本地',
+    set_stop: '停止下载', set_stop_desc: '中断插件正在进行的下载（克隆/增量全程生效，点击即停）',
+    notice_stop_idle: '当前没有进行中的下载',
     set_docs: '使用文档',
     pull_btn: '立即拉取',
     loading: '加载中…', refresh: '刷新',
@@ -212,6 +214,8 @@ const I18N = {
     set_obsidian: 'Sync .obsidian config folder', set_obsidian_desc: 'Sync plugin and appearance config from the repo; turn off to protect local settings',
     set_exclude: 'Extra exclude rules (one glob per line)', set_exclude_desc: '.git/, .trash/, community-plugins.json, workspace.json always excluded; ** spans levels, * single level, tmp/ matches a whole folder',
     set_pull: 'Pull now', set_pull_desc: 'Sync from remote with current settings',
+    set_stop: 'Stop download', set_stop_desc: 'Abort any in-progress download (clone and incremental alike, stops immediately)',
+    notice_stop_idle: 'No download in progress',
     set_docs: 'Documentation',
     pull_btn: 'Pull now',
     loading: 'Loading…', refresh: 'Refresh',
@@ -530,6 +534,13 @@ class GitPullPlugin extends Plugin {
       this._activeAbort = null;
       if (this._statusEl) this._statusEl.setText('');
     }
+  }
+
+  /** 停止当前下载：置 _cancelAll 标志位，克隆/增量全链路的检查点（清单获取/逐文件下载/写盘前）立即抛 aborted，
+   *  pull() 的 finally 统一复位。空闲时点击仅提示，无副作用 */
+  stopAll() {
+    if (!this._pullBusy || !this._activeAbort) { new Notice(this.t('notice_stop_idle'), 3000); return; }
+    this._activeAbort();
   }
 
   // ---------------- 全量克隆（depth=1 浅克隆 + 树遍历 + 对账跳写） ----------------
@@ -1064,6 +1075,14 @@ class GitPullSettingTab extends PluginSettingTab {
         .setButtonText(p.t('pull_btn'))
         .setCta()
         .onClick(() => p.pull()));
+
+    // 11.5 停止下载（中断插件全部下载操作：克隆/增量/清单获取/写盘前检查点）
+    new Setting(containerEl)
+      .setName(p.t('set_stop'))
+      .setDesc(p.t('set_stop_desc'))
+      .addButton((btn) => btn
+        .setButtonText(p.t('set_stop'))
+        .onClick(() => p.stopAll()));
 
     // 12. 使用文档
     new Setting(containerEl)
