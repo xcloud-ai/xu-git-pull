@@ -858,7 +858,9 @@ class FolderSuggest extends AbstractInputSuggest {
     this._onPick = onPick;
     this._rootLabel = rootLabel || '/';
   }
-  /** 深度优先收集全部目录（父目录在前，排序稳定），按输入过滤，限 60 条防长列表卡顿 */
+  /** 深度优先收集全部目录（父目录在前，排序稳定），按输入过滤，限 60 条防长列表卡顿。
+   *  雷区：TFolder 自带 isRoot() 方法（truthy），根目录标记必须用自有属性 xgpRoot，
+   *  否则 renderSuggestion 会把所有真实目录都判成根目录 */
   getSuggestions(query) {
     const q = String(query || '').toLowerCase().replace(/^\/+|\/+$/g, '');
     const folders = [];
@@ -868,12 +870,12 @@ class FolderSuggest extends AbstractInputSuggest {
       }
     };
     walk(this.app.vault.getRoot());
-    const all = [{ isRoot: true, path: '' }].concat(folders);
+    const all = [{ xgpRoot: true, path: '' }].concat(folders);
     const hit = q ? all.filter((x) => x.path.toLowerCase().includes(q)) : all;
     return hit.slice(0, 60);
   }
   renderSuggestion(item, el) {
-    el.setText(item.isRoot ? this._rootLabel : item.path);
+    el.setText(item.xgpRoot ? this._rootLabel : item.path);
   }
   selectSuggestion(item) {
     this.inputEl.value = item.path;
