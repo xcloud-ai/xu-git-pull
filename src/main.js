@@ -138,6 +138,7 @@ const I18N = {
     set_platform: '平台', set_platform_desc: '选择远程仓库托管平台',
     set_token: '访问令牌（Token）', set_token_desc: '私有库必填；公开库可不填。仅存本机，不上传',
     set_token_doc: '创建 Token', set_token_copied: '令牌创建页链接已复制，请在浏览器打开',
+    cascade_retry: '⚠ 加载失败，点击重试',
     set_repo: '仓库', set_repo_desc: '格式 owner/repo，支持嵌套命名空间',
     set_repo_placeholder: 'owner/repo',
     set_ref: '分支', set_ref_desc: '留空 = 跟随默认分支最新',
@@ -145,8 +146,6 @@ const I18N = {
     set_remote_path: '仓库子目录', set_remote_path_desc: '只拉取该子目录；「/」表示整个仓库',
     set_remote_root: '/（整个仓库）',
     set_local_path: '本地目标目录', set_local_path_desc: '下载到库中的位置，留空表示库根目录；点击输入框可从建议中选择',
-    set_refresh_lists: '刷新列表', set_refresh_lists_desc: '列表有缓存，远端新建的仓库/分支/子目录不会自动出现；点击强制重新拉取',
-    refreshing: '刷新中…',
     suggest_root: '（库根目录）',
     set_mode: '下载模式', set_mode_desc: '全量覆盖=速度最快；限速增量=只下变更、内存占用极小、断点续传',
     set_mode_clone: '全量覆盖（整仓克隆，桌面推荐）',
@@ -201,6 +200,7 @@ const I18N = {
     set_platform: 'Platform', set_platform_desc: 'Choose the remote hosting platform',
     set_token: 'Access Token', set_token_desc: 'Required for private repos; optional for public ones. Stored locally only',
     set_token_doc: 'Create Token', set_token_copied: 'Token creation link copied, open it in your browser',
+    cascade_retry: '⚠ Load failed, click to retry',
     set_repo: 'Repository', set_repo_desc: 'Format owner/repo, nested namespaces supported',
     set_repo_placeholder: 'owner/repo',
     set_ref: 'Branch', set_ref_desc: 'Empty = follow the default branch',
@@ -208,8 +208,6 @@ const I18N = {
     set_remote_path: 'Repository subfolder', set_remote_path_desc: 'Only pull this subfolder; "/" means the whole repo',
     set_remote_root: '/ (whole repo)',
     set_local_path: 'Local target folder', set_local_path_desc: 'Where files land in the vault; empty = vault root; click the box to pick from suggestions',
-    set_refresh_lists: 'Refresh lists', set_refresh_lists_desc: "Lists are cached; newly created repos/branches/folders won't show up automatically. Click to force re-fetch",
-    refreshing: 'Refreshing…',
     suggest_root: '(vault root)',
     set_mode: 'Download mode', set_mode_desc: 'Full clone = fastest; Rate-limited incremental = only changes, tiny memory, resumable',
     set_mode_clone: 'Full clone (desktop recommended)',
@@ -930,7 +928,9 @@ class GitPullSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.plugin = plugin;
-    this._autoTried = {}; // autoFillCascades 每 key 一次的尝试标记
+    this._cascadeSeq = 0; // 级联刷新轮次：快速连续切换时旧轮结果按 seq 作废
+    this._cascadeLast = 0; // 上一轮级联刷新完成时间（display 自动刷新 30s 节流，防重绘循环）
+    this._cascadeFailed = {}; // 级联键失败标记（repos/br/fo）→ 对应下拉注入「点击重试」项
   }
 
   display() {
@@ -961,9 +961,9 @@ class GitPullSettingTab extends PluginSettingTab {
         for (const cfg of PLATFORMS) dd.addOption(cfg.id, (cfg.id === 'gitcode' ? '🇨🇳 ' : '🌐 ') + cfg.name);
         dd.setValue(s.platform).onChange(async (v) => {
           s.platform = v;
-          this._autoTried = {}; // 新平台 → 重新自动拉取仓库/分支/目录
           await p.saveSettings();
           this.display();
+          void this.refreshCascade({ force: true }); // 新平台 → 实时重拉仓库/分支/目录
         });
       });
 
@@ -981,7 +981,7 @@ class GitPullSettingTab extends PluginSettingTab {
             p.cacheClear('repos:');
             await p.saveSettings();
           });
-        tx.inputEl.addEventListener('blur', () => { this._autoTried = {}; this.display(); });
+        tx.inputEl.addEventListener('blur', () => { this.display(); void this.refreshCascade({ force: true }); });
       })
       .addExtraButton((btn) => btn
         .setIcon('file-text')
@@ -991,13 +991,22 @@ class GitPullSettingTab extends PluginSettingTab {
           new Notice(p.t('notice_token_doc_copy'), 4000);
         }));
 
-    // 4. 仓库（级联下拉：token 仓库列表 + 当前值兜底；刷新走下方统一「刷新列表」按钮）
+    // 4. 仓库（级联下拉：token 仓库列表 + 当前值兜底；切换后分支/子目录自动实时重拉）
     const repoSetting = new Setting(containerEl)
       .setName(p.t('set_repo'))
       .setDesc(p.t('set_repo_desc'));
     this.buildCascade(repoSetting, {
+      key: 'repos',
       getValue: () => pf.repo || '',
-      setValue: async (v) => { pf.repo = v; this._autoTried = {}; await p.saveSettings(); },
+      setValue: async (v) => {
+        pf.repo = v;
+        await p.saveSettings();
+        // 切仓库：分支/子目录立即失效（下拉显示「加载中…」占位），按新仓库实时重拉
+        p.cacheClear('branches:');
+        p.cacheClear('folders:');
+        this.display();
+        void this.refreshCascade({ force: true, keys: ['br', 'fo'] });
+      },
       placeholder: p.t('set_repo_placeholder'),
       getCached: () => p.cacheGet('repos:' + p.token()),
     });
@@ -1013,28 +1022,6 @@ class GitPullSettingTab extends PluginSettingTab {
       .setName(p.t('set_remote_path'))
       .setDesc(p.t('set_remote_path_desc'));
     this.buildFolderCascade(rpSetting);
-
-    // 6.5 刷新列表（统一手动刷新：一次强制重拉仓库+分支+子目录，绕过缓存）
-    new Setting(containerEl)
-      .setName(p.t('set_refresh_lists'))
-      .setDesc(p.t('set_refresh_lists_desc'))
-      .addButton((btn) => btn
-        .setButtonText(p.t('refresh'))
-        .onClick(async () => {
-          btn.setButtonText(p.t('refreshing')).setDisabled(true);
-          const parts = (pf.repo || '').split('/');
-          const owner = parts[0], repo = parts.slice(1).join('/');
-          const jobs = [];
-          if (p.token()) jobs.push(() => p.fetchRepoList(true));
-          if (owner && repo) {
-            jobs.push(() => p.fetchBranchList(owner, repo, true));
-            jobs.push(() => p.fetchFolderList(owner, repo, pf.ref, true));
-          }
-          const results = await Promise.allSettled(jobs.map((run) => run()));
-          const failed = results.find((r) => r.status === 'rejected');
-          if (failed) new Notice(String((failed.reason && failed.reason.message) || failed.reason), 5000);
-          this.display();
-        }));
 
     // 7. 本地目标目录（FolderSuggest：点击/输入弹出库内目录建议，点击选中；保留手填新目录能力）
     new Setting(containerEl)
@@ -1128,55 +1115,62 @@ class GitPullSettingTab extends PluginSettingTab {
         .setTooltip(REPO_URL)
         .onClick(() => window.open(REPO_URL)));
 
-    // 渲染完成后后台自动补拉级联列表（仓库/分支/目录），成功后重绘一次
-    void this.autoFillCascades();
+    // 渲染完成后后台实时刷新级联列表（仓库/分支/目录）；30s 节流防重绘循环，交互路径走 force 绕过节流
+    void this.refreshCascade();
   }
 
-  /** 自动填充级联列表（恢复 1.9.2「打开设置即见列表」体验）：
-   *  有 Token 自动拉仓库列表；有 repo 自动拉分支与子目录。每个 key 每轮设置页会话只尝试一次，
-   *  失败静默（不打扰，手动刷新按钮仍可用），任一成功后重绘一次让下拉出现完整选项。 */
-  async autoFillCascades() {
+  /** 级联列表统一刷新：按依赖顺序串行 force 拉取（仓库→分支→子目录，上游 fetch 会级联清下游缓存，
+   *  并行会互相踩），完成或失败后重绘。交互触发（force）绕过 30s 节流；display() 自动触发受节流约束
+   *  防「display→拉取→重绘→再拉取」死循环；seq 守卫保证快速连续切换时旧轮结果作废不重绘。
+   *  失败不打断链路（逐键标记 _cascadeFailed，对应下拉出现「点击重试」项），失败轮同样推进节流时间戳。 */
+  async refreshCascade(opts = {}) {
+    const keys = opts.keys || ['repos', 'br', 'fo'];
+    if (!opts.force && Date.now() - this._cascadeLast < 30000) return;
+    const seq = (this._cascadeSeq = this._cascadeSeq + 1);
     const p = this.plugin;
     const s = p.settings;
     const pf = s.profiles[s.platform] || {};
     const parts = (pf.repo || '').split('/');
     const owner = parts[0] || '';
     const repo = parts.slice(1).join('/');
-    const jobs = [];
-    if (p.token() && !p.cacheGet('repos:' + p.token())) {
-      jobs.push({ k: 'repos', run: () => p.fetchRepoList(false) });
-    }
-    if (owner && repo) {
-      const brKey = 'branches:' + (p.token() ? 't' : 'a') + ':' + owner + '/' + repo;
-      const foKey = 'folders:' + (p.token() ? 't' : 'a') + ':' + owner + '/' + repo + '@' + (pf.ref || ':default');
-      if (!p.cacheGet(brKey)) jobs.push({ k: 'br', run: () => p.fetchBranchList(owner, repo, false) });
-      if (!p.cacheGet(foKey)) jobs.push({ k: 'fo', run: () => p.fetchFolderList(owner, repo, pf.ref, false) });
-    }
-    const todo = jobs.filter((j) => !this._autoTried[j.k]);
-    if (!todo.length) return;
-    for (const j of todo) this._autoTried[j.k] = true; // 同步标记，防并发/防循环
-    let filled = false;
-    await Promise.all(todo.map(async (j) => {
-      try { await j.run(); filled = true; } catch (e) {
-        console.warn('[xu-git-pull] 自动加载列表失败(' + j.k + '):', (e && e.message) || e);
+    const chain = [];
+    if (keys.includes('repos') && p.token()) chain.push(['repos', () => p.fetchRepoList(true)]);
+    if (owner && repo && keys.includes('br')) chain.push(['br', () => p.fetchBranchList(owner, repo, true)]);
+    if (owner && repo && keys.includes('fo')) chain.push(['fo', () => p.fetchFolderList(owner, repo, pf.ref, true)]);
+    if (!chain.length) return;
+    for (const [k, run] of chain) {
+      if (seq !== this._cascadeSeq) return; // 新一轮触发 → 本轮过期中止
+      try { await run(); delete this._cascadeFailed[k]; } catch (e) {
+        this._cascadeFailed[k] = true;
+        console.warn('[xu-git-pull] 级联列表刷新失败(' + k + '):', (e && e.message) || e);
       }
-    }));
-    if (filled) this.display();
+    }
+    if (seq !== this._cascadeSeq) return;
+    this._cascadeLast = Date.now();
+    this.display();
   }
 
-  /** 仓库级联：下拉（token 列表 + 当前值兜底）；列表不可用时保持手填，刷新走统一「刷新列表」按钮 */
+  /** 仓库级联：下拉（token 列表 + 当前值兜底）；缓存空注入「加载中…」、失败注入「点击重试」，
+   *  特殊值（__xgp_loading__/__xgp_retry__）在 change 中拦截，不落入 setValue */
   buildCascade(setting, opts) {
     const current = opts.getValue();
     const cached = opts.getCached ? opts.getCached() : null;
-    const list = cached && cached.length ? cached : (current ? [current] : []);
+    const hasData = !!(cached && cached.length);
+    const list = hasData ? cached : (current ? [current] : []);
     const options = list.slice();
     if (!options.some((x) => x === '')) options.unshift(''); // 首项恒为空值（显示 placeholder，可主动清空）
+    const special = this._cascadeFailed[opts.key] ? { v: '__xgp_retry__', label: this.plugin.t('cascade_retry') }
+      : (!hasData && this.plugin.token()) ? { v: '__xgp_loading__', label: this.plugin.t('loading') } : null;
     setting.addDropdown((dd) => {
       for (const item of options) dd.addOption(item, item || opts.placeholder || ' ');
+      if (special) dd.addOption(special.v, special.label);
       dd.selectEl.addClass('xgp-dropdown-wide');
       dd.setValue(current);
       dd.selectEl.addEventListener('change', async (ev) => {
-        await opts.setValue(ev.target.value);
+        const v = ev.target.value;
+        if (v === '__xgp_loading__') { dd.setValue(current); return; }
+        if (v === '__xgp_retry__') { dd.setValue(current); void this.refreshCascade({ force: true, keys: [opts.key] }); return; }
+        await opts.setValue(v);
       });
     });
   }
@@ -1189,17 +1183,26 @@ class GitPullSettingTab extends PluginSettingTab {
     const owner = m[0], repo = m.slice(1).join('/');
     const current = pf.ref || '';
     const cached = owner && repo ? p.cacheGet('branches:' + (p.token() ? 't' : 'a') + ':' + owner + '/' + repo) : null;
-    const list = cached && cached.length ? cached : [];
-    const options = [{ v: '', label: p.t('set_ref_default') }].concat(list.map((b) => ({ v: b, label: b })));
+    const hasData = !!(cached && cached.length);
+    const options = [{ v: '', label: p.t('set_ref_default') }].concat((hasData ? cached : []).map((b) => ({ v: b, label: b })));
     if (current && !options.some((o) => o.v === current)) options.push({ v: current, label: current });
+    const special = this._cascadeFailed.br ? { v: '__xgp_retry__', label: p.t('cascade_retry') }
+      : (!hasData && owner && repo) ? { v: '__xgp_loading__', label: p.t('loading') } : null;
     setting.addDropdown((dd) => {
       for (const o of options) dd.addOption(o.v, o.label);
+      if (special) dd.addOption(special.v, special.label);
       dd.selectEl.addClass('xgp-dropdown-wide');
       dd.setValue(current);
       dd.selectEl.addEventListener('change', async (ev) => {
-        pf.ref = ev.target.value;
-        this._autoTried = {}; // 分支变化 → 子目录列表按新分支重拉
+        const v = ev.target.value;
+        if (v === '__xgp_loading__') { dd.setValue(current); return; }
+        if (v === '__xgp_retry__') { dd.setValue(current); void this.refreshCascade({ force: true, keys: ['br'] }); return; }
+        pf.ref = v;
         await p.saveSettings();
+        // 分支变化 → 子目录立即失效并按新分支实时重拉
+        p.cacheClear('folders:');
+        this.display();
+        void this.refreshCascade({ force: true, keys: ['fo'] });
       });
       if (!owner || !repo) dd.setDisabled(true);
     });
@@ -1213,15 +1216,21 @@ class GitPullSettingTab extends PluginSettingTab {
     const owner = m[0], repo = m.slice(1).join('/');
     const current = pf.remotePath || '';
     const cached = owner && repo ? p.cacheGet('folders:' + (p.token() ? 't' : 'a') + ':' + owner + '/' + repo + '@' + (pf.ref || ':default')) : null;
-    const list = cached && cached.length ? cached : [];
-    const options = [{ v: '', label: p.t('set_remote_root') }].concat(list.map((f) => ({ v: f, label: '/' + f })));
+    const hasData = !!(cached && cached.length);
+    const options = [{ v: '', label: p.t('set_remote_root') }].concat((hasData ? cached : []).map((f) => ({ v: f, label: '/' + f })));
     if (current && !options.some((o) => o.v === current)) options.push({ v: current, label: '/' + current });
+    const special = this._cascadeFailed.fo ? { v: '__xgp_retry__', label: p.t('cascade_retry') }
+      : (!hasData && owner && repo) ? { v: '__xgp_loading__', label: p.t('loading') } : null;
     setting.addDropdown((dd) => {
       for (const o of options) dd.addOption(o.v, o.label);
+      if (special) dd.addOption(special.v, special.label);
       dd.selectEl.addClass('xgp-dropdown-wide');
       dd.setValue(current);
       dd.selectEl.addEventListener('change', async (ev) => {
-        pf.remotePath = ev.target.value;
+        const v = ev.target.value;
+        if (v === '__xgp_loading__') { dd.setValue(current); return; }
+        if (v === '__xgp_retry__') { dd.setValue(current); void this.refreshCascade({ force: true, keys: ['fo'] }); return; }
+        pf.remotePath = v;
         await p.saveSettings();
       });
       if (!owner || !repo) dd.setDisabled(true);
