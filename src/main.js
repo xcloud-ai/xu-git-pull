@@ -183,7 +183,7 @@ const I18N = {
     err_download_timeout: '下载超时：网络无响应',
     incremental_hint: '限速增量同步：{rpm} 个/分钟，只下载有变更的文件',
     incr_tree: '正在获取远程文件清单…',
-    incr_start: '增量下载 {n}/{total}',
+    incr_start: '增量下载 {n}/{total}（{skip} 个无变更跳过）',
     incr_wait: '触发限流，等待 {s}s 后重试…',
     incr_none: '增量同步：无变更（{total} 个文件均为最新）',
     incr_done: '增量同步完成：更新 {n} 个、清理远程已删除 {d} 个（{m} 个无变更跳过），耗时 {s}s',
@@ -246,7 +246,7 @@ const I18N = {
     err_download_timeout: 'Download timed out: no network response',
     incremental_hint: 'Incremental sync: {rpm} files/min, only changed files are downloaded',
     incr_tree: 'Fetching remote file list…',
-    incr_start: 'Incremental {n}/{total}',
+    incr_start: 'Incremental {n}/{total} ({skip} unchanged skipped)',
     incr_wait: 'Rate limited, retrying in {s}s…',
     incr_none: 'Incremental: no changes ({total} files up to date)',
     incr_done: 'Incremental done: {n} updated, {d} remote-deleted cleaned ({m} unchanged skipped), {s}s',
@@ -749,13 +749,15 @@ class GitPullPlugin extends Plugin {
       } catch (e) { changed.push(t); }
     }
     const t0 = Date.now();
+    // 进度通知口径：total = 真实待下载（变更集），skip = 无变更跳过——避免显示全库数造成「从头重下」错觉
+    const skip = targets.length - changed.length;
     if (changed.length === 0) {
       notice.hide();
       if (deleted > 0) new Notice(this.t('incr_done', { n: 0, m: 0, d: deleted, s: 0 }), 8000);
       else new Notice(this.t('incr_none', { total: targets.length }), 8000);
       return;
     }
-    notice.setMessage(this.t('incr_start', { n: 0, total: targets.length }));
+    notice.setMessage(this.t('incr_start', { n: 0, total: changed.length, skip }));
     if (this._statusEl) this._statusEl.setText('⬇ 0/' + changed.length);
 
     const rpm = (this.settings.ratePerMin && this.settings.ratePerMin[this.settings.platform]) || 40;
@@ -796,7 +798,7 @@ class GitPullPlugin extends Plugin {
             notice.setMessage(this.t('incr_wait', { s: 60 }));
             if (this._statusEl) this._statusEl.setText('⬇ ' + done + '/' + changed.length + ' (...60s)');
             await sleep(60000);
-            notice.setMessage(this.t('incr_start', { n: done, total: targets.length }));
+            notice.setMessage(this.t('incr_start', { n: done, total: changed.length, skip }));
           } else if (err.code === 'unauthorized' || err.code === 'not_found') {
             throw err;
           } else {
@@ -816,7 +818,7 @@ class GitPullPlugin extends Plugin {
       dirty++;
       done++;
       if (dirty >= 20) { await this.saveManifestSafe(mKey, manifest); dirty = 0; }
-      notice.setMessage(this.t('incr_start', { n: done, total: targets.length }));
+      notice.setMessage(this.t('incr_start', { n: done, total: changed.length, skip }));
       if (this._statusEl) this._statusEl.setText('⬇ ' + done + '/' + changed.length);
     }
     await this.saveManifestSafe(mKey, manifest);
