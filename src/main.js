@@ -44,6 +44,7 @@ const DEFAULT_SETTINGS = {
   downloadMode: { desktop: 'clone', mobile: 'clone' },
   ratePerMin: { github: 60, gitcode: 40, gitee: 50 },
   includeObsidian: true,
+  keepAwake: true,
   exclude: '',
 };
 
@@ -84,6 +85,7 @@ function normalizeSettings(raw) {
     out.ratePerMin = { github: v, gitcode: v, gitee: v };
   }
   out.includeObsidian = raw && typeof raw.includeObsidian === 'boolean' ? raw.includeObsidian : d.includeObsidian;
+  out.keepAwake = raw && typeof raw.keepAwake === 'boolean' ? raw.keepAwake : d.keepAwake;
   out.exclude = raw && typeof raw.exclude === 'string' ? raw.exclude : '';
   return out;
 }
@@ -155,6 +157,8 @@ const I18N = {
     set_pull: '立即拉取', set_pull_desc: '按当前配置从远程同步到本地',
     set_stop: '停止下载', set_stop_desc: '中断插件正在进行的下载（克隆/增量全程生效，点击即停）',
     notice_stop_idle: '当前没有进行中的下载',
+    set_keep_awake: '下载时保持屏幕常亮', set_keep_awake_desc: '防自动锁屏中断下载；手动锁屏仍会暂停，解锁后重新拉取可断点续传',
+    notice_wakelock_unsupported: '当前设备不支持保持屏幕常亮，下载期间请保持屏幕亮起',
     set_docs: '使用文档',
     pull_btn: '立即拉取',
     loading: '加载中…', refresh: '刷新',
@@ -216,6 +220,8 @@ const I18N = {
     set_pull: 'Pull now', set_pull_desc: 'Sync from remote with current settings',
     set_stop: 'Stop download', set_stop_desc: 'Abort any in-progress download (clone and incremental alike, stops immediately)',
     notice_stop_idle: 'No download in progress',
+    set_keep_awake: 'Keep screen awake during download', set_keep_awake_desc: "Prevents auto-lock from interrupting downloads; a manual lock still pauses it — resume by pulling again (checkpointed)",
+    notice_wakelock_unsupported: 'Screen wake lock is not supported on this device; keep the screen on during the download',
     set_docs: 'Documentation',
     pull_btn: 'Pull now',
     loading: 'Loading…', refresh: 'Refresh',
@@ -314,6 +320,10 @@ class GitPullPlugin extends Plugin {
     this._statusEl = this.addStatusBarItem();
     if (this._statusEl && this._statusEl.addClass) this._statusEl.addClass('xgp-status');
     this.registerDomEvent(this._statusEl, 'click', () => { if (this._activeAbort) this._activeAbort(); });
+    // Wake Lock 在应用切后台/锁屏时被系统自动释放，回到前台若下载仍在进行则重新获取
+    this.registerDomEvent(document, 'visibilitychange', () => {
+      if (document.visibilityState === 'visible' && this._pullBusy) void this.acquireWakeLock();
+    });
     this.addSettingTab(new GitPullSettingTab(this.app, this));
   }
 
@@ -510,6 +520,7 @@ class GitPullPlugin extends Plugin {
       this._statusEl.setAttribute('title', this.t('statusbar_cancel_hint'));
       this._statusEl.setText('⬇ ' + this.t('clone_checking'));
     }
+    await this.acquireWakeLock();
     try {
       const platKey = Platform.isMobile ? 'mobile' : 'desktop';
       const dm = (this.settings.downloadMode && this.settings.downloadMode[platKey]) || 'clone';
@@ -530,6 +541,7 @@ class GitPullPlugin extends Plugin {
       if (Platform.isMobile) new Notice(this.t('clone_fail_mobile_hint'), 8000);
       new Notice(this.t('clone_fail', { reason: String((err && err.message) || err) }), 6000);
     } finally {
+      void this.releaseWakeLock();
       this._pullBusy = false;
       this._activeAbort = null;
       if (this._statusEl) this._statusEl.setText('');
@@ -541,6 +553,22 @@ class GitPullPlugin extends Plugin {
   stopAll() {
     if (!this._pullBusy || !this._activeAbort) { new Notice(this.t('notice_stop_idle'), 3000); return; }
     this._activeAbort();
+  }
+
+  // ---------------- Wake Lock（下载期间防自动锁屏：仅防“自动锁屏”，手动锁屏仍会暂停，断点续传兜底） ----------------
+  async acquireWakeLock() {
+    if (!this.settings.keepAwake || this._wakeLock || !Platform.isMobile) return;
+    try {
+      if (!navigator.wakeLock) { new Notice(this.t('notice_wakelock_unsupported'), 5000); return; }
+      this._wakeLock = await navigator.wakeLock.request('screen');
+      this._wakeLock.addEventListener('release', () => { this._wakeLock = null; });
+    } catch (e) { console.warn('[' + PLUGIN_ID + '] Wake Lock 获取失败:', (e && e.message) || e); }
+  }
+
+  async releaseWakeLock() {
+    const wl = this._wakeLock;
+    this._wakeLock = null;
+    try { if (wl) await wl.release(); } catch (e) { /* 系统已自动释放属预期 */ }
   }
 
   // ---------------- 全量克隆（depth=1 浅克隆 + 树遍历 + 对账跳写） ----------------
@@ -1066,6 +1094,12 @@ class GitPullSettingTab extends PluginSettingTab {
           .setPlaceholder('*.log\ntmp/')
           .onChange(async (v) => { s.exclude = v; await p.saveSettings(); });
       });
+
+    // 10.5 下载时保持屏幕常亮（Wake Lock 防自动锁屏；手动锁屏仍暂停，断点续传兜底）
+    new Setting(containerEl)
+      .setName(p.t('set_keep_awake'))
+      .setDesc(p.t('set_keep_awake_desc'))
+      .addToggle((tg) => tg.setValue(s.keepAwake).onChange(async (v) => { s.keepAwake = v; await p.saveSettings(); }));
 
     // 11. 立即拉取
     new Setting(containerEl)
